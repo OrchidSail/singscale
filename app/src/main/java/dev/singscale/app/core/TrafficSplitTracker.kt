@@ -7,17 +7,42 @@ import io.nekohasekai.libbox.Libbox
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.EnumMap
 import java.util.Locale
+import kotlin.math.floor
 import kotlin.math.max
 
-enum class TrafficRouteCategory(val label: String, val badge: String) {
-    RELAY_EXIT("走组网中继 / 出口", "中继/出口"),
-    TAILNET_MESH("组网内网直达", "组网内网"),
-    DIRECT("本地物理直连", "本地直连");
-
-    val isTunnelRouted: Boolean
-        get() = this == RELAY_EXIT || this == TAILNET_MESH
+/**
+ * Three mutually-exclusive routing traffic categories:
+ * - [RELAY_EXIT]: Internet traffic forwarded via Exit Node / Peer Relay / Proxy-over-Tailscale.
+ * - [TAILNET_MESH]: Direct Tailnet mesh traffic (`ts-mesh` -> `ts-ep`: 100.64.0.0/10, fd7a:115c:a1e0::/48,
+ *   MagicDNS peers, and advertised Tailnet subnet routes).
+ * - [DIRECT]: Local physical ISP / LAN direct traffic (`direct`).
+ */
+enum class TrafficRouteCategory(
+    val label: String,
+    val badge: String,
+    val shortLabel: String
+) {
+    RELAY_EXIT("中继 / 出口", "中继/出口", "中继"),
+    TAILNET_MESH("组网直连", "组网直连", "组网直连"),
+    DIRECT("本地直连", "本地直连", "本地直连")
 }
+
+@Immutable
+data class KernelBucketTotals(
+    val uplinkBytes: Long = 0L,
+    val downlinkBytes: Long = 0L,
+    val activeConnections: Int = 0,
+    val totalConnections: Int = 0
+)
+
+@Immutable
+data class KernelTrafficSplit(
+    val direct: KernelBucketTotals = KernelBucketTotals(),
+    val mesh: KernelBucketTotals = KernelBucketTotals(),
+    val relay: KernelBucketTotals = KernelBucketTotals()
+)
 
 @Immutable
 data class TrackedConnectionItem(
@@ -39,7 +64,8 @@ data class TrackedConnectionItem(
     val downlinkTotal: Long,
     val createdAtMs: Long,
     val closedAtMs: Long = 0L,
-    val packageName: String = ""
+    val packageName: String = "",
+    val transportPath: TransportPathType = TransportPathType.OFFLINE
 ) {
     val isActive: Boolean get() = closedAtMs == 0L
     val totalBps: Long get() = uplinkBps + downlinkBps
@@ -61,7 +87,8 @@ data class DomainTrafficSummary(
     val protocols: List<String>,
     val targetAddresses: List<String>,
     val matchedRule: String,
-    val lastActiveAtMs: Long
+    val lastActiveAtMs: Long,
+    val transportPath: TransportPathType = TransportPathType.OFFLINE
 ) {
     val totalBps: Long get() = uplinkBps + downlinkBps
     val totalBytes: Long get() = uplinkTotal + downlinkTotal
@@ -69,45 +96,82 @@ data class DomainTrafficSummary(
 
 @Immutable
 data class TrafficSplitSnapshot(
+    // 1. 中继 / 出口 (Exit Node / Peer Relay / Proxy-over-TS) — strictly excludes Tailnet Mesh
     val relayUpBps: Long = 0L,
     val relayDownBps: Long = 0L,
-    val directUpBps: Long = 0L,
-    val directDownBps: Long = 0L,
     val relayUpBytes: Long = 0L,
     val relayDownBytes: Long = 0L,
+    val activeRelayConnections: Int = 0,
+    val totalRelayConnections: Int = 0,
+    val relayBpsHistory: List<Float> = List(30) { 0f },
+
+    // 2. 组网直连 (Tailnet Mesh: 100.64.0.0/10, fd7a:115c:a1e0::/48, MagicDNS, advertised subnets)
+    val meshUpBps: Long = 0L,
+    val meshDownBps: Long = 0L,
+    val meshUpBytes: Long = 0L,
+    val meshDownBytes: Long = 0L,
+    val activeMeshConnections: Int = 0,
+    val totalMeshConnections: Int = 0,
+    val meshBpsHistory: List<Float> = List(30) { 0f },
+
+    // 3. 本地直连 (Physical ISP / LAN direct)
+    val directUpBps: Long = 0L,
+    val directDownBps: Long = 0L,
     val directUpBytes: Long = 0L,
     val directDownBytes: Long = 0L,
-    val meshBytes: Long = 0L,
-    val activeRelayConnections: Int = 0,
     val activeDirectConnections: Int = 0,
-    val relayBpsHistory: List<Float> = List(30) { 0f },
+    val totalDirectConnections: Int = 0,
     val directBpsHistory: List<Float> = List(30) { 0f },
+
     val domains: List<DomainTrafficSummary> = emptyList(),
     val connections: List<TrackedConnectionItem> = emptyList(),
     val updatedAtMs: Long = 0L
 ) {
     val relayTotalBps: Long get() = relayUpBps + relayDownBps
+    val meshTotalBps: Long get() = meshUpBps + meshDownBps
     val directTotalBps: Long get() = directUpBps + directDownBps
-    val combinedBps: Long get() = relayTotalBps + directTotalBps
+    val combinedUpBps: Long get() = relayUpBps + meshUpBps + directUpBps
+    val combinedDownBps: Long get() = relayDownBps + meshDownBps + directDownBps
+    val combinedBps: Long get() = relayTotalBps + meshTotalBps + directTotalBps
 
     val relayTotalBytes: Long get() = relayUpBytes + relayDownBytes
+    val meshTotalBytes: Long get() = meshUpBytes + meshDownBytes
+    val meshBytes: Long get() = meshTotalBytes
     val directTotalBytes: Long get() = directUpBytes + directDownBytes
-    val combinedBytes: Long get() = relayTotalBytes + directTotalBytes
+    val combinedUpBytes: Long get() = relayUpBytes + meshUpBytes + directUpBytes
+    val combinedDownBytes: Long get() = relayDownBytes + meshDownBytes + directDownBytes
+    val combinedBytes: Long get() = relayTotalBytes + meshTotalBytes + directTotalBytes
 
-    val relayShareRatio: Float
-        get() = when {
-            combinedBytes > 0L -> (relayTotalBytes.toDouble() / combinedBytes.toDouble()).toFloat().coerceIn(0f, 1f)
-            combinedBps > 0L -> (relayTotalBps.toDouble() / combinedBps.toDouble()).toFloat().coerceIn(0f, 1f)
-            else -> 0.5f
-        }
+    val totalActiveConnections: Int
+        get() = activeRelayConnections + activeMeshConnections + activeDirectConnections
+
+    val totalTrackedConnections: Int
+        get() = totalRelayConnections + totalMeshConnections + totalDirectConnections
+
+    val relayShareRatio: Float get() = computeRatio(relayTotalBytes, relayTotalBps)
+    val meshShareRatio: Float get() = computeRatio(meshTotalBytes, meshTotalBps)
+    val directShareRatio: Float get() = computeRatio(directTotalBytes, directTotalBps)
 
     val relaySharePercent: Float
         get() = if (combinedBytes > 0L) {
             ((relayTotalBytes.toDouble() * 100.0) / combinedBytes.toDouble()).toFloat().coerceIn(0f, 100f)
         } else 0f
 
+    val meshSharePercent: Float
+        get() = if (combinedBytes > 0L) {
+            ((meshTotalBytes.toDouble() * 100.0) / combinedBytes.toDouble()).toFloat().coerceIn(0f, 100f)
+        } else 0f
+
     val directSharePercent: Float
-        get() = if (combinedBytes > 0L) (100f - relaySharePercent).coerceIn(0f, 100f) else 0f
+        get() = if (combinedBytes > 0L) {
+            (100.0 - relaySharePercent.toDouble() - meshSharePercent.toDouble()).toFloat().coerceIn(0f, 100f)
+        } else 0f
+
+    private fun computeRatio(bucketBytes: Long, bucketBps: Long): Float = when {
+        combinedBytes > 0L -> (bucketBytes.toDouble() / combinedBytes.toDouble()).toFloat().coerceIn(0f, 1f)
+        combinedBps > 0L -> (bucketBps.toDouble() / combinedBps.toDouble()).toFloat().coerceIn(0f, 1f)
+        else -> 0f
+    }
 }
 
 object TrafficFormat {
@@ -144,8 +208,14 @@ object TrafficFormat {
 }
 
 /**
- * Real-time split traffic & per-domain/per-connection telemetry tracker powered by sing-box
- * `CommandConnections` stream + DNS reverse-resolution enrichment.
+ * Real-time 3-way split traffic & per-domain/per-connection telemetry tracker powered by sing-box
+ * `CommandConnections` stream, kernel-level `SingScaleGetTrafficSplitJSON` reconciliation,
+ * and DNS reverse-resolution enrichment.
+ *
+ * Guarantees strict mutual exclusivity and sum conservation across:
+ *   1. 中继 / 出口 ([TrafficRouteCategory.RELAY_EXIT])
+ *   2. 组网直连 ([TrafficRouteCategory.TAILNET_MESH])
+ *   3. 本地直连 ([TrafficRouteCategory.DIRECT])
  */
 object TrafficSplitTracker {
 
@@ -175,6 +245,31 @@ object TrafficSplitTracker {
         var packageName: String = ""
     )
 
+    private data class BucketTotals(
+        var upBytes: Long = 0L,
+        var downBytes: Long = 0L,
+        var totalConnections: Int = 0
+    ) {
+        fun add(up: Long, down: Long, conns: Int) {
+            upBytes += max(0L, up)
+            downBytes += max(0L, down)
+            totalConnections += max(0, conns)
+        }
+
+        fun reset() {
+            upBytes = 0L
+            downBytes = 0L
+            totalConnections = 0
+        }
+    }
+
+    private fun newBucketMap(): EnumMap<TrafficRouteCategory, BucketTotals> =
+        EnumMap<TrafficRouteCategory, BucketTotals>(TrafficRouteCategory::class.java).apply {
+            for (cat in TrafficRouteCategory.entries) {
+                put(cat, BucketTotals())
+            }
+        }
+
     private val lock = Any()
     private val connectionsMap = LinkedHashMap<String, RawConnData>()
     private val ipToDomainCache = object : LinkedHashMap<String, String>(128, 0.75f, true) {
@@ -183,34 +278,83 @@ object TrafficSplitTracker {
         }
     }
 
-    // Archived totals from hot-reloaded instances or evicted closed connections so cumulative bytes never drop
-    private var archivedRelayUp: Long = 0L
-    private var archivedRelayDown: Long = 0L
-    private var archivedDirectUp: Long = 0L
-    private var archivedDirectDown: Long = 0L
-    private var archivedMeshBytes: Long = 0L
+    // Finalized totals from previous sing-box instances before hot-reloads
+    private val priorEpochsArchived = newBucketMap()
+
+    // Evicted closed-connection totals (from connectionsMap cap OR Go trafficcontrol eviction) for current epoch
+    private val currentEpochEvicted = newBucketMap()
     private var lastInstanceEpoch: Int = 0
 
     private val relayHistory = ArrayDeque<Float>(HISTORY_POINTS).apply { repeat(HISTORY_POINTS) { addLast(0f) } }
+    private val meshHistory = ArrayDeque<Float>(HISTORY_POINTS).apply { repeat(HISTORY_POINTS) { addLast(0f) } }
     private val directHistory = ArrayDeque<Float>(HISTORY_POINTS).apply { repeat(HISTORY_POINTS) { addLast(0f) } }
 
     private val _state = MutableStateFlow(TrafficSplitSnapshot())
     val state: StateFlow<TrafficSplitSnapshot> = _state.asStateFlow()
 
+    /**
+     * Computes sum-conserving 1-decimal percentage tenths (0..1000, summing to 1000 when total > 0)
+     * for `(relay, mesh, direct)` using the largest-remainder method so UI labels ALWAYS sum to 100.0%.
+     */
+    fun computeDisplayTenths(relayBytes: Long, meshBytes: Long, directBytes: Long): Triple<Int, Int, Int> {
+        val r = max(0L, relayBytes)
+        val m = max(0L, meshBytes)
+        val d = max(0L, directBytes)
+        val total = r + m + d
+        if (total <= 0L) return Triple(0, 0, 0)
+
+        val values = longArrayOf(r, m, d)
+        val floors = IntArray(3)
+        val remainders = DoubleArray(3)
+        var sumFloors = 0
+        for (i in 0..2) {
+            val exact = values[i].toDouble() * 1000.0 / total.toDouble()
+            val f = floor(exact).toInt().coerceIn(0, 1000)
+            floors[i] = f
+            remainders[i] = exact - f
+            sumFloors += f
+        }
+        var leftover = (1000 - sumFloors).coerceAtLeast(0)
+        val order = listOf(0, 1, 2).sortedWith(
+            compareByDescending<Int> { remainders[it] }
+                .thenByDescending { values[it] }
+        )
+        var idx = 0
+        while (leftover > 0 && idx < order.size) {
+            val bucketIdx = order[idx]
+            if (values[bucketIdx] > 0L) {
+                floors[bucketIdx]++
+                leftover--
+            }
+            idx++
+        }
+        return Triple(floors[0], floors[1], floors[2])
+    }
+
+    fun computeDisplayPercents(relayBytes: Long, meshBytes: Long, directBytes: Long): Triple<String, String, String> {
+        val (rt, mt, dt) = computeDisplayTenths(relayBytes, meshBytes, directBytes)
+        return Triple(
+            String.format(Locale.US, "%.1f%%", rt / 10.0),
+            String.format(Locale.US, "%.1f%%", mt / 10.0),
+            String.format(Locale.US, "%.1f%%", dt / 10.0)
+        )
+    }
+
     fun resetSession() {
         synchronized(lock) {
             connectionsMap.clear()
             ipToDomainCache.clear()
-            archivedRelayUp = 0L
-            archivedRelayDown = 0L
-            archivedDirectUp = 0L
-            archivedDirectDown = 0L
-            archivedMeshBytes = 0L
+            for (cat in TrafficRouteCategory.entries) {
+                priorEpochsArchived[cat]!!.reset()
+                currentEpochEvicted[cat]!!.reset()
+            }
             lastInstanceEpoch = 0
             relayHistory.clear()
+            meshHistory.clear()
             directHistory.clear()
             repeat(HISTORY_POINTS) {
                 relayHistory.addLast(0f)
+                meshHistory.addLast(0f)
                 directHistory.addLast(0f)
             }
             _state.value = TrafficSplitSnapshot(updatedAtMs = System.currentTimeMillis())
@@ -223,12 +367,51 @@ object TrafficSplitTracker {
         if (cleanDomain.isBlank() || cleanIp.isBlank()) return
         synchronized(lock) {
             ipToDomainCache[cleanIp] = cleanDomain
-            // Backfill any already-open pure-IP connection matching cleanIp
             for (entry in connectionsMap.values) {
                 if (entry.domain.isBlank() && extractHost(entry.destination) == cleanIp) {
                     entry.domain = cleanDomain
                 }
             }
+        }
+    }
+
+    /**
+     * Reconciles exact kernel-level cumulative 3-way bucket totals from Go `trafficcontrol.Manager`
+     * so connections evicted while UI telemetry was paused in background/screen-off are never lost
+     * and never double-counted.
+     */
+    fun reconcileKernelTotals(
+        kernelSplit: KernelTrafficSplit,
+        uiState: SingScaleUiState,
+        instanceEpoch: Int
+    ) {
+        val now = System.currentTimeMillis()
+        synchronized(lock) {
+            if (lastInstanceEpoch == 0 && instanceEpoch != 0) {
+                lastInstanceEpoch = instanceEpoch
+            } else if (instanceEpoch != 0 && lastInstanceEpoch != 0 && instanceEpoch != lastInstanceEpoch) {
+                // Ignore stale response from a previous instance epoch
+                return
+            }
+
+            val mapTotals = computeMapTotalsLocked()
+            val kernelByCat = mapOf(
+                TrafficRouteCategory.DIRECT to kernelSplit.direct,
+                TrafficRouteCategory.TAILNET_MESH to kernelSplit.mesh,
+                TrafficRouteCategory.RELAY_EXIT to kernelSplit.relay
+            )
+            for (cat in TrafficRouteCategory.entries) {
+                val kernel = kernelByCat[cat] ?: continue
+                val mapB = mapTotals[cat]!!
+                val evB = currentEpochEvicted[cat]!!
+                val missingUp = max(0L, kernel.uplinkBytes - mapB.upBytes)
+                val missingDown = max(0L, kernel.downlinkBytes - mapB.downBytes)
+                val missingConns = max(0, kernel.totalConnections - mapB.totalConnections)
+                if (missingUp > evB.upBytes) evB.upBytes = missingUp
+                if (missingDown > evB.downBytes) evB.downBytes = missingDown
+                if (missingConns > evB.totalConnections) evB.totalConnections = missingConns
+            }
+            publishSnapshotLocked(uiState, now, pushHistory = false)
         }
     }
 
@@ -240,15 +423,25 @@ object TrafficSplitTracker {
         events ?: return
         val now = System.currentTimeMillis()
         synchronized(lock) {
+            var sameEpochPreResetFloor: EnumMap<TrafficRouteCategory, BucketTotals>? = null
+
             if (events.reset) {
                 if (lastInstanceEpoch != 0 && instanceEpoch != lastInstanceEpoch) {
-                    archiveMapTotalsLocked(uiState)
+                    finalizeCurrentEpochIntoPriorLocked()
+                } else if (lastInstanceEpoch == instanceEpoch) {
+                    // Stream reconnected on the same instance epoch (e.g., returning from background):
+                    // snapshot monotonic floor so totals never dip before kernel reconciliation arrives.
+                    sameEpochPreResetFloor = snapshotCurrentEpochTotalsLocked()
+                    for (cat in TrafficRouteCategory.entries) {
+                        currentEpochEvicted[cat]!!.reset()
+                    }
                 }
                 lastInstanceEpoch = instanceEpoch
                 connectionsMap.clear()
             } else if (lastInstanceEpoch == 0 && instanceEpoch != 0) {
                 lastInstanceEpoch = instanceEpoch
             }
+
             val iter = events.iterator()
             if (iter != null) {
                 val typeNew = Libbox.ConnectionEventNew.toInt()
@@ -304,14 +497,18 @@ object TrafficSplitTracker {
                     }
                 }
             }
-            evictExcessClosedLocked(uiState)
+
+            if (sameEpochPreResetFloor != null) {
+                applyMonotonicFloorLocked(sameEpochPreResetFloor)
+            }
+            evictExcessClosedLocked()
             publishSnapshotLocked(uiState, now, pushHistory = false)
         }
     }
 
     /**
-     * Called once every 1000ms while tunnel is running so live speeds decay smoothly to 0 B/s
-     * when idle and the 30-second dual-series sparkline advances in real time.
+     * Called once every ~1.5s ONLY while app is foreground & screen is ON so live speeds decay
+     * smoothly to 0 B/s when idle and the 30-point 3-way sparkline advances cleanly.
      */
     fun tick1Hz(uiState: SingScaleUiState, nowMs: Long = System.currentTimeMillis()) {
         synchronized(lock) {
@@ -328,11 +525,56 @@ object TrafficSplitTracker {
     /**
      * Pure-Kotlin helper used by unit tests to inject synthetic connection records without JNI.
      */
-    internal fun ingestSyntheticRecordForTest(record: RawConnData, uiState: SingScaleUiState, pushHistory: Boolean = true) {
+    internal fun ingestSyntheticRecordForTest(
+        record: RawConnData,
+        uiState: SingScaleUiState,
+        pushHistory: Boolean = true,
+        instanceEpoch: Int = 1
+    ) {
         synchronized(lock) {
+            if (lastInstanceEpoch == 0 && instanceEpoch != 0) {
+                lastInstanceEpoch = instanceEpoch
+            }
             connectionsMap[record.id] = record
-            evictExcessClosedLocked(uiState)
-            publishSnapshotLocked(uiState, record.lastSeenAtMs.takeIf { it > 0L } ?: System.currentTimeMillis(), pushHistory)
+            evictExcessClosedLocked()
+            publishSnapshotLocked(
+                uiState,
+                record.lastSeenAtMs.takeIf { it > 0L } ?: System.currentTimeMillis(),
+                pushHistory
+            )
+        }
+    }
+
+    /**
+     * Pure-Kotlin helper used by unit tests to simulate `ConnectionEvents(reset = true)` across
+     * same-epoch foreground reconnects and new-epoch hot-reloads.
+     */
+    internal fun simulateResetBatchForTest(
+        newRecords: List<RawConnData>,
+        uiState: SingScaleUiState,
+        instanceEpoch: Int,
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        synchronized(lock) {
+            var sameEpochFloor: EnumMap<TrafficRouteCategory, BucketTotals>? = null
+            if (lastInstanceEpoch != 0 && instanceEpoch != lastInstanceEpoch) {
+                finalizeCurrentEpochIntoPriorLocked()
+            } else if (lastInstanceEpoch == instanceEpoch) {
+                sameEpochFloor = snapshotCurrentEpochTotalsLocked()
+                for (cat in TrafficRouteCategory.entries) {
+                    currentEpochEvicted[cat]!!.reset()
+                }
+            }
+            lastInstanceEpoch = instanceEpoch
+            connectionsMap.clear()
+            for (r in newRecords) {
+                connectionsMap[r.id] = r
+            }
+            if (sameEpochFloor != null) {
+                applyMonotonicFloorLocked(sameEpochFloor)
+            }
+            evictExcessClosedLocked()
+            publishSnapshotLocked(uiState, nowMs, pushHistory = false)
         }
     }
 
@@ -382,40 +624,56 @@ object TrafficSplitTracker {
         )
     }
 
-    private fun archiveMapTotalsLocked(uiState: SingScaleUiState) {
+    private fun computeMapTotalsLocked(): EnumMap<TrafficRouteCategory, BucketTotals> {
+        val totals = newBucketMap()
         for (c in connectionsMap.values) {
-            val cat = classifyRouteCategory(c.outboundTag, c.chain, c.destination)
-            if (cat.isTunnelRouted) {
-                archivedRelayUp += c.uplinkTotal
-                archivedRelayDown += c.downlinkTotal
-                if (cat == TrafficRouteCategory.TAILNET_MESH) {
-                    archivedMeshBytes += (c.uplinkTotal + c.downlinkTotal)
-                }
-            } else {
-                archivedDirectUp += c.uplinkTotal
-                archivedDirectDown += c.downlinkTotal
-            }
+            val cat = classifyRouteCategory(c.outboundTag, c.chain, c.destination, c.rule)
+            totals[cat]!!.add(c.uplinkTotal, c.downlinkTotal, 1)
+        }
+        return totals
+    }
+
+    private fun snapshotCurrentEpochTotalsLocked(): EnumMap<TrafficRouteCategory, BucketTotals> {
+        val mapTotals = computeMapTotalsLocked()
+        val combined = newBucketMap()
+        for (cat in TrafficRouteCategory.entries) {
+            val ev = currentEpochEvicted[cat]!!
+            val mp = mapTotals[cat]!!
+            combined[cat]!!.add(ev.upBytes + mp.upBytes, ev.downBytes + mp.downBytes, ev.totalConnections + mp.totalConnections)
+        }
+        return combined
+    }
+
+    private fun finalizeCurrentEpochIntoPriorLocked() {
+        val current = snapshotCurrentEpochTotalsLocked()
+        for (cat in TrafficRouteCategory.entries) {
+            val c = current[cat]!!
+            priorEpochsArchived[cat]!!.add(c.upBytes, c.downBytes, c.totalConnections)
+            currentEpochEvicted[cat]!!.reset()
         }
     }
 
-    private fun evictExcessClosedLocked(uiState: SingScaleUiState) {
+    private fun applyMonotonicFloorLocked(prevEpochTotals: EnumMap<TrafficRouteCategory, BucketTotals>) {
+        val newMapTotals = computeMapTotalsLocked()
+        for (cat in TrafficRouteCategory.entries) {
+            val prev = prevEpochTotals[cat]!!
+            val curMap = newMapTotals[cat]!!
+            val ev = currentEpochEvicted[cat]!!
+            ev.upBytes = max(ev.upBytes, max(0L, prev.upBytes - curMap.upBytes))
+            ev.downBytes = max(ev.downBytes, max(0L, prev.downBytes - curMap.downBytes))
+            ev.totalConnections = max(ev.totalConnections, max(0, prev.totalConnections - curMap.totalConnections))
+        }
+    }
+
+    private fun evictExcessClosedLocked() {
         val closedEntries = connectionsMap.values.filter { it.closedAtMs != 0L }
         if (closedEntries.size <= MAX_CLOSED_RETENTION) return
         val toEvict = closedEntries
             .sortedBy { it.closedAtMs }
             .take(closedEntries.size - MAX_CLOSED_RETENTION)
         for (c in toEvict) {
-            val cat = classifyRouteCategory(c.outboundTag, c.chain, c.destination)
-            if (cat.isTunnelRouted) {
-                archivedRelayUp += c.uplinkTotal
-                archivedRelayDown += c.downlinkTotal
-                if (cat == TrafficRouteCategory.TAILNET_MESH) {
-                    archivedMeshBytes += (c.uplinkTotal + c.downlinkTotal)
-                }
-            } else {
-                archivedDirectUp += c.uplinkTotal
-                archivedDirectDown += c.downlinkTotal
-            }
+            val cat = classifyRouteCategory(c.outboundTag, c.chain, c.destination, c.rule)
+            currentEpochEvicted[cat]!!.add(c.uplinkTotal, c.downlinkTotal, 1)
             connectionsMap.remove(c.id)
         }
     }
@@ -430,16 +688,14 @@ object TrafficSplitTracker {
 
         var liveRelayUpBps = 0L
         var liveRelayDownBps = 0L
+        var liveMeshUpBps = 0L
+        var liveMeshDownBps = 0L
         var liveDirectUpBps = 0L
         var liveDirectDownBps = 0L
 
-        var mapRelayUpBytes = 0L
-        var mapRelayDownBytes = 0L
-        var mapDirectUpBytes = 0L
-        var mapDirectDownBytes = 0L
-        var mapMeshBytes = 0L
-
+        val mapTotals = newBucketMap()
         var activeRelayCount = 0
+        var activeMeshCount = 0
         var activeDirectCount = 0
 
         val items = ArrayList<TrackedConnectionItem>(connectionsMap.size)
@@ -447,36 +703,43 @@ object TrafficSplitTracker {
         for (c in connectionsMap.values) {
             val destHost = extractHost(c.destination)
             val peerMatch = peerByIp[destHost]
+            val cat = classifyRouteCategory(c.outboundTag, c.chain, c.destination, c.rule)
+            val subnetPeer = if (cat == TrafficRouteCategory.TAILNET_MESH && peerMatch == null) {
+                findSubnetRouterPeer(destHost, uiState.peers)
+            } else null
+
             val enrichedDomain = when {
                 c.domain.isNotBlank() -> c.domain
-                peerMatch != null -> "${peerMatch.displayName} (${destHost})"
+                peerMatch != null -> "${peerMatch.displayName} ($destHost)"
                 else -> ipToDomainCache[destHost].orEmpty()
             }
             val effectiveHost = enrichedDomain.ifBlank { destHost.ifBlank { c.destination.ifBlank { "未知目标" } } }
 
-            val cat = classifyRouteCategory(c.outboundTag, c.chain, c.destination)
-            val nodeLabel = resolveRouteNodeLabel(cat, c.outboundTag, peerMatch, uiState)
+            val nodeLabel = resolveRouteNodeLabel(cat, c.outboundTag, peerMatch, subnetPeer, uiState)
+            val transportPath = resolveTransportPath(cat, peerMatch, subnetPeer, uiState)
             val chainLabel = if (c.chain.isNotEmpty()) {
                 c.chain.asReversed().joinToString(" → ")
             } else {
                 c.outboundTag.ifBlank { "direct" }
             }
 
-            if (cat.isTunnelRouted) {
-                liveRelayUpBps += c.uplinkBps
-                liveRelayDownBps += c.downlinkBps
-                mapRelayUpBytes += c.uplinkTotal
-                mapRelayDownBytes += c.downlinkTotal
-                if (cat == TrafficRouteCategory.TAILNET_MESH) {
-                    mapMeshBytes += (c.uplinkTotal + c.downlinkTotal)
+            mapTotals[cat]!!.add(c.uplinkTotal, c.downlinkTotal, 1)
+            when (cat) {
+                TrafficRouteCategory.RELAY_EXIT -> {
+                    liveRelayUpBps += c.uplinkBps
+                    liveRelayDownBps += c.downlinkBps
+                    if (c.closedAtMs == 0L) activeRelayCount++
                 }
-                if (c.closedAtMs == 0L) activeRelayCount++
-            } else {
-                liveDirectUpBps += c.uplinkBps
-                liveDirectDownBps += c.downlinkBps
-                mapDirectUpBytes += c.uplinkTotal
-                mapDirectDownBytes += c.downlinkTotal
-                if (c.closedAtMs == 0L) activeDirectCount++
+                TrafficRouteCategory.TAILNET_MESH -> {
+                    liveMeshUpBps += c.uplinkBps
+                    liveMeshDownBps += c.downlinkBps
+                    if (c.closedAtMs == 0L) activeMeshCount++
+                }
+                TrafficRouteCategory.DIRECT -> {
+                    liveDirectUpBps += c.uplinkBps
+                    liveDirectDownBps += c.downlinkBps
+                    if (c.closedAtMs == 0L) activeDirectCount++
+                }
             }
 
             items.add(
@@ -499,7 +762,8 @@ object TrafficSplitTracker {
                     downlinkTotal = c.downlinkTotal,
                     createdAtMs = c.createdAtMs,
                     closedAtMs = c.closedAtMs,
-                    packageName = c.packageName
+                    packageName = c.packageName,
+                    transportPath = transportPath
                 )
             )
         }
@@ -511,7 +775,7 @@ object TrafficSplitTracker {
                 .thenByDescending { max(it.createdAtMs, it.closedAtMs) }
         )
 
-        // Aggregate by effectiveHost (Domain / Host Leaderboard)
+        // Aggregate by effectiveHost across all 3 mutually-exclusive categories
         val domainGroups = items.groupBy { it.effectiveHost.lowercase() }
         val domainSummaries = ArrayList<DomainTrafficSummary>(domainGroups.size)
         for ((_, group) in domainGroups) {
@@ -521,8 +785,8 @@ object TrafficSplitTracker {
             var dUpTotal = 0L
             var dDownTotal = 0L
             var actCnt = 0
-            var relayBytesInGroup = 0L
-            var directBytesInGroup = 0L
+            val bytesByCat = EnumMap<TrafficRouteCategory, Long>(TrafficRouteCategory::class.java)
+            val bpsByCat = EnumMap<TrafficRouteCategory, Long>(TrafficRouteCategory::class.java)
             var latestMs = 0L
             val protoSet = LinkedHashSet<String>()
             val addrSet = LinkedHashSet<String>()
@@ -533,11 +797,8 @@ object TrafficSplitTracker {
                 dUpTotal += g.uplinkTotal
                 dDownTotal += g.downlinkTotal
                 if (g.isActive) actCnt++
-                if (g.routeCategory.isTunnelRouted) {
-                    relayBytesInGroup += g.totalBytes
-                } else {
-                    directBytesInGroup += g.totalBytes
-                }
+                bytesByCat[g.routeCategory] = (bytesByCat[g.routeCategory] ?: 0L) + g.totalBytes
+                bpsByCat[g.routeCategory] = (bpsByCat[g.routeCategory] ?: 0L) + g.totalBps
                 val ts = max(g.createdAtMs, g.closedAtMs)
                 if (ts > latestMs) latestMs = ts
                 if (g.protocol.isNotBlank()) protoSet.add(g.protocol)
@@ -545,11 +806,14 @@ object TrafficSplitTracker {
                 if (g.destination.isNotBlank()) addrSet.add(g.destination)
             }
 
-            val dominantItem = if (relayBytesInGroup >= directBytesInGroup) {
-                group.firstOrNull { it.routeCategory.isTunnelRouted } ?: sample
-            } else {
-                group.firstOrNull { !it.routeCategory.isTunnelRouted } ?: sample
-            }
+            val dominantCategory = TrafficRouteCategory.entries
+                .filter { cat -> group.any { it.routeCategory == cat } }
+                .maxWithOrNull(
+                    compareBy<TrafficRouteCategory> { bytesByCat[it] ?: 0L }
+                        .thenBy { bpsByCat[it] ?: 0L }
+                        .thenBy { if (it == sample.routeCategory) 1 else 0 }
+                ) ?: sample.routeCategory
+            val dominantItem = group.firstOrNull { it.routeCategory == dominantCategory } ?: sample
 
             val hostDisplay = sample.effectiveHost
             val pureIp = sample.domain.isBlank() && isIpLiteral(extractHost(sample.destination))
@@ -569,7 +833,8 @@ object TrafficSplitTracker {
                     protocols = protoSet.take(4),
                     targetAddresses = addrSet.take(4),
                     matchedRule = dominantItem.matchedRule,
-                    lastActiveAtMs = latestMs
+                    lastActiveAtMs = latestMs,
+                    transportPath = dominantItem.transportPath
                 )
             )
         }
@@ -585,51 +850,102 @@ object TrafficSplitTracker {
             if (relayHistory.size >= HISTORY_POINTS) relayHistory.removeFirst()
             relayHistory.addLast((liveRelayUpBps + liveRelayDownBps).toFloat())
 
+            if (meshHistory.size >= HISTORY_POINTS) meshHistory.removeFirst()
+            meshHistory.addLast((liveMeshUpBps + liveMeshDownBps).toFloat())
+
             if (directHistory.size >= HISTORY_POINTS) directHistory.removeFirst()
             directHistory.addLast((liveDirectUpBps + liveDirectDownBps).toFloat())
         }
 
+        fun finalUp(cat: TrafficRouteCategory): Long =
+            priorEpochsArchived[cat]!!.upBytes + currentEpochEvicted[cat]!!.upBytes + mapTotals[cat]!!.upBytes
+
+        fun finalDown(cat: TrafficRouteCategory): Long =
+            priorEpochsArchived[cat]!!.downBytes + currentEpochEvicted[cat]!!.downBytes + mapTotals[cat]!!.downBytes
+
+        fun finalConns(cat: TrafficRouteCategory, active: Int): Int =
+            max(
+                active,
+                priorEpochsArchived[cat]!!.totalConnections +
+                    currentEpochEvicted[cat]!!.totalConnections +
+                    mapTotals[cat]!!.totalConnections
+            )
+
         _state.value = TrafficSplitSnapshot(
             relayUpBps = liveRelayUpBps,
             relayDownBps = liveRelayDownBps,
+            relayUpBytes = finalUp(TrafficRouteCategory.RELAY_EXIT),
+            relayDownBytes = finalDown(TrafficRouteCategory.RELAY_EXIT),
+            activeRelayConnections = activeRelayCount,
+            totalRelayConnections = finalConns(TrafficRouteCategory.RELAY_EXIT, activeRelayCount),
+            relayBpsHistory = relayHistory.toList(),
+
+            meshUpBps = liveMeshUpBps,
+            meshDownBps = liveMeshDownBps,
+            meshUpBytes = finalUp(TrafficRouteCategory.TAILNET_MESH),
+            meshDownBytes = finalDown(TrafficRouteCategory.TAILNET_MESH),
+            activeMeshConnections = activeMeshCount,
+            totalMeshConnections = finalConns(TrafficRouteCategory.TAILNET_MESH, activeMeshCount),
+            meshBpsHistory = meshHistory.toList(),
+
             directUpBps = liveDirectUpBps,
             directDownBps = liveDirectDownBps,
-            relayUpBytes = archivedRelayUp + mapRelayUpBytes,
-            relayDownBytes = archivedRelayDown + mapRelayDownBytes,
-            directUpBytes = archivedDirectUp + mapDirectUpBytes,
-            directDownBytes = archivedDirectDown + mapDirectDownBytes,
-            meshBytes = archivedMeshBytes + mapMeshBytes,
-            activeRelayConnections = activeRelayCount,
+            directUpBytes = finalUp(TrafficRouteCategory.DIRECT),
+            directDownBytes = finalDown(TrafficRouteCategory.DIRECT),
             activeDirectConnections = activeDirectCount,
-            relayBpsHistory = relayHistory.toList(),
+            totalDirectConnections = finalConns(TrafficRouteCategory.DIRECT, activeDirectCount),
             directBpsHistory = directHistory.toList(),
+
             domains = domainSummaries,
             connections = items,
             updatedAtMs = nowMs
         )
     }
 
+    /**
+     * Exact mirror of Go `trafficcontrol.ClassifySingScaleBucket` so Android UI and sing-box kernel
+     * agree 100% on Local Direct vs Tailnet Mesh Direct vs Relay/Exit bucketing.
+     */
     internal fun classifyRouteCategory(
         outboundTag: String,
         chain: List<String>,
-        destination: String
+        destination: String,
+        rule: String = ""
     ): TrafficRouteCategory {
-        val leaf = outboundTag.lowercase()
-        if (leaf == ConfigBuilder.OUTBOUND_DIRECT || (leaf.isBlank() && chain.any { it.equals(ConfigBuilder.OUTBOUND_DIRECT, true) })) {
+        val leaf = outboundTag.trim().lowercase()
+        fun hasChainTag(target: String): Boolean =
+            chain.any { it.trim().equals(target, ignoreCase = true) }
+
+        if (leaf == ConfigBuilder.OUTBOUND_DIRECT || (leaf.isBlank() && hasChainTag(ConfigBuilder.OUTBOUND_DIRECT))) {
             return TrafficRouteCategory.DIRECT
         }
         if (leaf == ConfigBuilder.OUTBOUND_EXIT || leaf == ConfigBuilder.OUTBOUND_RELAY ||
-            chain.any { it == ConfigBuilder.OUTBOUND_EXIT || it == ConfigBuilder.OUTBOUND_RELAY }
+            hasChainTag(ConfigBuilder.OUTBOUND_EXIT) || hasChainTag(ConfigBuilder.OUTBOUND_RELAY)
         ) {
             return TrafficRouteCategory.RELAY_EXIT
         }
-        if (leaf == ConfigBuilder.ENDPOINT_TAG || chain.any { it == ConfigBuilder.ENDPOINT_TAG }) {
+        if (leaf == ConfigBuilder.OUTBOUND_MESH || hasChainTag(ConfigBuilder.OUTBOUND_MESH)) {
+            return TrafficRouteCategory.TAILNET_MESH
+        }
+        if (leaf == ConfigBuilder.ENDPOINT_TAG || hasChainTag(ConfigBuilder.ENDPOINT_TAG)) {
             val host = extractHost(destination)
-            return if (isTailnetIp(host)) {
-                TrafficRouteCategory.TAILNET_MESH
-            } else {
-                TrafficRouteCategory.RELAY_EXIT
+            if (isTailnetIp(host)) {
+                return TrafficRouteCategory.TAILNET_MESH
             }
+            if (hasChainTag(ConfigBuilder.OUTBOUND_SELECTOR)) {
+                return TrafficRouteCategory.RELAY_EXIT
+            }
+            if (chain.isNotEmpty()) {
+                // Directly routed to ts-ep without egress-select (e.g. advertised Tailnet subnet route)
+                return TrafficRouteCategory.TAILNET_MESH
+            }
+            if (rule.contains("100.64.0.0/10") || rule.lowercase().contains("fd7a:115c:a1e0::/48")) {
+                return TrafficRouteCategory.TAILNET_MESH
+            }
+            return TrafficRouteCategory.RELAY_EXIT
+        }
+        if (hasChainTag(ConfigBuilder.OUTBOUND_SELECTOR)) {
+            return TrafficRouteCategory.RELAY_EXIT
         }
         return TrafficRouteCategory.DIRECT
     }
@@ -638,12 +954,15 @@ object TrafficSplitTracker {
         category: TrafficRouteCategory,
         outboundTag: String,
         destPeer: TailnetPeer?,
+        subnetPeer: TailnetPeer?,
         uiState: SingScaleUiState
     ): String {
         return when (category) {
             TrafficRouteCategory.DIRECT -> "本地直连"
-            TrafficRouteCategory.TAILNET_MESH -> {
-                destPeer?.displayName?.let { "组网直达 · $it" } ?: "组网内网"
+            TrafficRouteCategory.TAILNET_MESH -> when {
+                destPeer != null -> "组网直连 · ${destPeer.displayName}"
+                subnetPeer != null -> "组网子网 · ${subnetPeer.displayName}"
+                else -> "组网直连"
             }
             TrafficRouteCategory.RELAY_EXIT -> {
                 val exitName = uiState.activeExitPeer?.displayName
@@ -653,19 +972,31 @@ object TrafficSplitTracker {
                     !relayName.isNullOrBlank() && !exitName.isNullOrBlank() && relayName != exitName -> "$relayName → $exitName"
                     !exitName.isNullOrBlank() -> "中继/出口 · $exitName"
                     !relayName.isNullOrBlank() -> "中继 · $relayName"
-                    else -> "组网中继/出口"
+                    else -> "中继/出口"
                 }
             }
         }
     }
 
+    private fun resolveTransportPath(
+        category: TrafficRouteCategory,
+        destPeer: TailnetPeer?,
+        subnetPeer: TailnetPeer?,
+        uiState: SingScaleUiState
+    ): TransportPathType = when (category) {
+        TrafficRouteCategory.DIRECT -> TransportPathType.OFFLINE
+        TrafficRouteCategory.TAILNET_MESH -> (destPeer ?: subnetPeer)?.effectivePathType ?: TransportPathType.OFFLINE
+        TrafficRouteCategory.RELAY_EXIT -> (uiState.activeExitPeer ?: uiState.activeRelayPeer)?.effectivePathType
+            ?: uiState.activeQuality.pathType
+    }
+
     private fun humanizeRule(rawRule: String, category: TrafficRouteCategory): String {
         val r = rawRule.trim()
         if (r.isBlank()) {
-            return if (category == TrafficRouteCategory.DIRECT) {
-                "默认直连规则 (final → direct)"
-            } else {
-                "默认组网出口规则 (final → egress-select)"
+            return when (category) {
+                TrafficRouteCategory.DIRECT -> "默认本地直连规则 (final → direct)"
+                TrafficRouteCategory.TAILNET_MESH -> "Tailnet 组网直连规则 (→ ts-mesh)"
+                TrafficRouteCategory.RELAY_EXIT -> "默认中继/出口规则 (final → egress-select)"
             }
         }
         if (r.startsWith("direct-first(")) {
@@ -677,13 +1008,47 @@ object TrafficSplitTracker {
             return "直连质量欠佳 ($detail) → 自动走中继/出口"
         }
         return when {
-            r.contains("100.64.0.0/10") -> "Tailnet 内网段直达 ($r)"
+            r.contains("100.64.0.0/10") || r.lowercase().contains("fd7a:115c:a1e0::/48") -> "Tailnet 组网直连 ($r)"
+            category == TrafficRouteCategory.TAILNET_MESH -> "Tailnet 组网子网直连 ($r)"
             r.contains("ip_is_private") -> "局域网私网直连 ($r)"
             r.contains("tailscale.com") -> "Tailscale 控制面保活直连"
             r.contains("domain_suffix") && category == TrafficRouteCategory.DIRECT -> "自定义直连域名 ($r)"
-            r.contains("domain_suffix") && category.isTunnelRouted -> "强制/规则代理域名分流 ($r)"
+            r.contains("domain_suffix") && category == TrafficRouteCategory.RELAY_EXIT -> "强制/规则中继域名分流 ($r)"
             else -> r
         }
+    }
+
+    private fun findSubnetRouterPeer(destHost: String, peers: List<TailnetPeer>): TailnetPeer? {
+        val ipLong = parseIpv4ToLong(destHost) ?: return null
+        var bestPeer: TailnetPeer? = null
+        var bestPrefixLen = -1
+        for (peer in peers) {
+            for (cidr in peer.subnetRoutes) {
+                val slash = cidr.indexOf('/')
+                if (slash <= 0) continue
+                val netLong = parseIpv4ToLong(cidr.substring(0, slash)) ?: continue
+                val bits = cidr.substring(slash + 1).toIntOrNull() ?: continue
+                if (bits !in 1..32) continue
+                val mask = (-1L shl (32 - bits)) and 0xFFFFFFFFL
+                if ((ipLong and mask) == (netLong and mask) && bits > bestPrefixLen) {
+                    bestPrefixLen = bits
+                    bestPeer = peer
+                }
+            }
+        }
+        return bestPeer
+    }
+
+    private fun parseIpv4ToLong(host: String): Long? {
+        val parts = host.trim().split('.')
+        if (parts.size != 4) return null
+        var raw = 0L
+        for (p in parts) {
+            val v = p.toIntOrNull() ?: return null
+            if (v !in 0..255) return null
+            raw = (raw shl 8) or v.toLong()
+        }
+        return raw
     }
 
     private fun extractHost(addrPort: String): String {
@@ -704,13 +1069,13 @@ object TrafficSplitTracker {
 
     private fun isIpLiteral(host: String): Boolean {
         if (host.isBlank()) return false
-        if (host.contains(':')) return true // IPv6 literal
+        if (host.contains(':')) return true
         val parts = host.split('.')
         return parts.size == 4 && parts.all { p -> p.toIntOrNull()?.let { it in 0..255 } == true }
     }
 
     private fun isTailnetIp(host: String): Boolean {
-        val h = host.lowercase()
+        val h = host.trim().substringBefore('%').lowercase()
         if (h.startsWith("fd7a:115c:a1e0:")) return true
         val parts = h.split('.')
         if (parts.size != 4) return false

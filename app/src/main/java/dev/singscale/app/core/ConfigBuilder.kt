@@ -25,6 +25,7 @@ import java.net.URI
 object ConfigBuilder {
 
     const val ENDPOINT_TAG = "ts-ep"
+    const val OUTBOUND_MESH = "ts-mesh"
     const val OUTBOUND_DIRECT = "direct"
     const val OUTBOUND_RELAY = "peer-relay"
     const val OUTBOUND_EXIT = "peer-exit"
@@ -217,6 +218,16 @@ object ConfigBuilder {
             relayPeer != null -> ENDPOINT_TAG
             else -> OUTBOUND_DIRECT
         }
+
+        outboundsList.add(
+            buildJsonObject {
+                put("type", "selector")
+                put("tag", OUTBOUND_MESH)
+                put("outbounds", JsonArray(listOf(JsonPrimitive(ENDPOINT_TAG))))
+                put("default", ENDPOINT_TAG)
+                put("interrupt_exist_connections", false)
+            }
+        )
 
         outboundsList.add(
             buildJsonObject {
@@ -611,7 +622,7 @@ object ConfigBuilder {
             )
         }
 
-        // 4. Tailscale CGNAT (100.64.0.0/10) & ULA (fd7a:115c:a1e0::/48) ALWAYS route via ts-ep
+        // 4. Tailscale CGNAT (100.64.0.0/10) & ULA (fd7a:115c:a1e0::/48) ALWAYS route via dedicated ts-mesh -> ts-ep
         rules.add(
             buildJsonObject {
                 put(
@@ -621,16 +632,16 @@ object ConfigBuilder {
                         add(JsonPrimitive("fd7a:115c:a1e0::/48"))
                     }
                 )
-                put("outbound", ENDPOINT_TAG)
+                put("outbound", OUTBOUND_MESH)
             }
         )
 
-        // 5. Advertised Tailnet subnet routes
+        // 5. Advertised Tailnet subnet routes via dedicated ts-mesh -> ts-ep
         if (peerSubnets.isNotEmpty()) {
             rules.add(
                 buildJsonObject {
                     put("ip_cidr", JsonArray(peerSubnets.map { JsonPrimitive(it) }))
-                    put("outbound", ENDPOINT_TAG)
+                    put("outbound", OUTBOUND_MESH)
                 }
             )
         }

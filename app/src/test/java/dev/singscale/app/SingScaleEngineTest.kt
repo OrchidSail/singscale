@@ -3,6 +3,8 @@ package dev.singscale.app
 import dev.singscale.app.core.ConfigBuilder
 import dev.singscale.app.core.DynamicTier
 import dev.singscale.app.core.GatewayProbeStatus
+import dev.singscale.app.core.KernelBucketTotals
+import dev.singscale.app.core.KernelTrafficSplit
 import dev.singscale.app.core.LinkQualityMetrics
 import dev.singscale.app.core.PeerEndpointConfig
 import dev.singscale.app.core.PeerGatewayMode
@@ -412,7 +414,7 @@ class SingScaleEngineTest {
     }
 
     @Test
-    fun `traffic split tracker accurately separates relay vs direct, aggregates domains, enriches dns, and decays idle speeds`() {
+    fun `traffic split tracker accurately separates relay, mesh, and direct, aggregates domains, enriches dns, and decays idle speeds`() {
         TrafficSplitTracker.resetSession()
         val now = 1_700_000_000_000L
 
@@ -421,25 +423,27 @@ class SingScaleEngineTest {
             hostName = "exit-node-1",
             tailscaleIPs = listOf("100.64.0.50"),
             online = true,
-            exitNodeOption = true
+            exitNodeOption = true,
+            curAddr = "203.0.113.50:41641"
         )
         val meshPeer = TailnetPeer(
             stableId = "mesh-1",
             hostName = "mesh-peer-1",
             tailscaleIPs = listOf("100.64.0.51"),
-            online = true
+            online = true,
+            curAddr = "198.51.100.51:41641"
         )
         val uiState = SingScaleUiState(
             peers = listOf(sampleExit, meshPeer),
             activeExitPeerId = "exit-1"
         )
 
-        // 1. Two relayed connections to api.github.com (one with SNI, one raw IP enriched via DNS log)
+        // 1. Two relayed connections to api.github.com (one with SNI, one raw IP enriched via DNS log) -> 800,000 bytes (40%)
         TrafficSplitTracker.ingestSyntheticRecordForTest(
             TrafficSplitTracker.RawConnData(
                 id = "conn-gh-1",
                 domain = "api.github.com",
-                destination = "140.82.114.6:443",
+                destination = "203.0.113.6:443",
                 source = "172.19.0.1:52301",
                 network = "TCP",
                 protocol = "TLS",
@@ -461,7 +465,7 @@ class SingScaleEngineTest {
             TrafficSplitTracker.RawConnData(
                 id = "conn-gh-2",
                 domain = "",
-                destination = "140.82.114.6:443",
+                destination = "203.0.113.6:443",
                 source = "172.19.0.1:52302",
                 network = "UDP",
                 protocol = "QUIC",
@@ -479,44 +483,44 @@ class SingScaleEngineTest {
             uiState = uiState
         )
 
-        // Enrich raw IP 140.82.114.6 -> api.github.com
-        TrafficSplitTracker.onDnsResolved("api.github.com.", "140.82.114.6")
+        // Enrich raw IP 203.0.113.6 -> api.github.com
+        TrafficSplitTracker.onDnsResolved("api.github.com.", "203.0.113.6")
 
-        // 2. One Tailnet mesh connection to 100.64.0.51:22 (counted under tunnel/relay bucket with TAILNET_MESH badge)
+        // 2. One Tailnet mesh direct connection to 100.64.0.51:22 -> 200,000 bytes (10%) in dedicated TAILNET_MESH bucket!
         TrafficSplitTracker.ingestSyntheticRecordForTest(
             TrafficSplitTracker.RawConnData(
                 id = "conn-mesh-1",
                 domain = "",
                 destination = "100.64.0.51:22",
-                source = "172.19.0.1:52310",
+                source = "100.64.0.100:52310",
                 network = "TCP",
                 protocol = "SSH",
                 outboundTag = ConfigBuilder.ENDPOINT_TAG,
-                chain = listOf(ConfigBuilder.ENDPOINT_TAG),
-                rule = "ip_cidr=100.64.0.0/10 => ts-ep",
+                chain = listOf(ConfigBuilder.ENDPOINT_TAG, ConfigBuilder.OUTBOUND_MESH),
+                rule = "ip_cidr=100.64.0.0/10 => ts-mesh",
                 createdAtMs = now - 1500L,
                 uplinkTotal = 50_000L,
                 downlinkTotal = 150_000L,
-                uplinkBps = 0L,
-                downlinkBps = 0L,
+                uplinkBps = 5_000L,
+                downlinkBps = 25_000L,
                 lastRateAtMs = now,
                 lastSeenAtMs = now
             ),
             uiState = uiState
         )
 
-        // 3. One direct connection to www.bilibili.com (1,000,000 bytes -> exact 50% / 50% split with 1,000,000 tunnel bytes)
+        // 3. One direct connection to www.example.com -> 1,000,000 bytes (50%)
         TrafficSplitTracker.ingestSyntheticRecordForTest(
             TrafficSplitTracker.RawConnData(
                 id = "conn-direct-1",
-                domain = "www.bilibili.com",
-                destination = "119.29.29.29:443",
-                source = "172.19.0.1:52320",
+                domain = "www.example.com",
+                destination = "192.0.2.29:443",
+                source = "100.64.0.100:52320",
                 network = "TCP",
                 protocol = "TLS",
                 outboundTag = ConfigBuilder.OUTBOUND_DIRECT,
                 chain = listOf(ConfigBuilder.OUTBOUND_DIRECT),
-                rule = "domain_suffix=.bilibili.com => direct",
+                rule = "domain_suffix=.example.com => direct",
                 createdAtMs = now - 1000L,
                 uplinkTotal = 200_000L,
                 downlinkTotal = 800_000L,
@@ -529,15 +533,38 @@ class SingScaleEngineTest {
         )
 
         val snap = TrafficSplitTracker.state.value
-        assertEquals(1_000_000L, snap.relayTotalBytes)
-        assertEquals(1_000_000L, snap.directTotalBytes)
-        assertEquals(200_000L, snap.meshBytes)
+        // Relay/Exit strictly excludes Tailnet Mesh!
+        assertEquals(150_000L, snap.relayUpBytes)
+        assertEquals(650_000L, snap.relayDownBytes)
+        assertEquals(800_000L, snap.relayTotalBytes)
         assertEquals(250_000L, snap.relayTotalBps)
+        assertEquals(2, snap.activeRelayConnections)
+
+        // Tailnet Mesh has its own independent up/down/total/bps/connections!
+        assertEquals(50_000L, snap.meshUpBytes)
+        assertEquals(150_000L, snap.meshDownBytes)
+        assertEquals(200_000L, snap.meshTotalBytes)
+        assertEquals(200_000L, snap.meshBytes)
+        assertEquals(30_000L, snap.meshTotalBps)
+        assertEquals(1, snap.activeMeshConnections)
+
+        // Local Direct is strictly independent!
+        assertEquals(200_000L, snap.directUpBytes)
+        assertEquals(800_000L, snap.directDownBytes)
+        assertEquals(1_000_000L, snap.directTotalBytes)
         assertEquals(400_000L, snap.directTotalBps)
-        assertEquals(50f, snap.relaySharePercent, 0.05f)
-        assertEquals(50f, snap.directSharePercent, 0.05f)
-        assertEquals(3, snap.activeRelayConnections)
         assertEquals(1, snap.activeDirectConnections)
+
+        // Exact 3-way sum conservation (no double-counting, no omissions)
+        assertEquals(2_000_000L, snap.combinedBytes)
+        assertEquals(snap.relayUpBytes + snap.meshUpBytes + snap.directUpBytes, snap.combinedUpBytes)
+        assertEquals(snap.relayDownBytes + snap.meshDownBytes + snap.directDownBytes, snap.combinedDownBytes)
+        assertEquals(680_000L, snap.combinedBps)
+        assertEquals(4, snap.totalActiveConnections)
+        assertEquals(40f, snap.relaySharePercent, 0.05f)
+        assertEquals(10f, snap.meshSharePercent, 0.05f)
+        assertEquals(50f, snap.directSharePercent, 0.05f)
+        assertEquals(100f, snap.relaySharePercent + snap.meshSharePercent + snap.directSharePercent, 0.01f)
 
         // Both conn-gh-1 and conn-gh-2 must merge into a single DomainTrafficSummary for api.github.com
         assertEquals(3, snap.domains.size)
@@ -549,14 +576,18 @@ class SingScaleEngineTest {
 
         val meshSummary = snap.domains.first { it.primaryCategory == TrafficRouteCategory.TAILNET_MESH }
         assertTrue(meshSummary.host.contains("mesh-peer-1"))
+        assertEquals(TransportPathType.DIRECT, meshSummary.transportPath)
 
         // 4. Advance clock past RATE_STALE_MS via tick1Hz -> idle socket speeds decay to 0 B/s while cumulative totals remain intact
         TrafficSplitTracker.tick1Hz(uiState = uiState, nowMs = now + 3_000L)
         val decayed = TrafficSplitTracker.state.value
         assertEquals(0L, decayed.relayTotalBps)
+        assertEquals(0L, decayed.meshTotalBps)
         assertEquals(0L, decayed.directTotalBps)
-        assertEquals(1_000_000L, decayed.relayTotalBytes)
+        assertEquals(800_000L, decayed.relayTotalBytes)
+        assertEquals(200_000L, decayed.meshTotalBytes)
         assertEquals(1_000_000L, decayed.directTotalBytes)
+        assertEquals(2_000_000L, decayed.combinedBytes)
     }
 
     @Test
@@ -945,5 +976,296 @@ class SingScaleEngineTest {
         assertEquals(512L * mib, SingScaleApp.computeOomProcessRssBudgetBytes(6L * gib))
         assertEquals(640L * mib, SingScaleApp.computeOomProcessRssBudgetBytes(8L * gib))
         assertEquals(640L * mib, SingScaleApp.computeOomProcessRssBudgetBytes(12L * gib))
+    }
+
+    @Test
+    fun `config builder isolates tailnet mesh rules onto dedicated ts-mesh outbound separate from egress-select`() {
+        val subnetRouter = TailnetPeer(
+            stableId = "office-gw",
+            hostName = "office-gw",
+            tailscaleIPs = listOf("100.64.0.99"),
+            online = true,
+            primaryRoutes = listOf("198.51.100.0/24")
+        )
+        val exitPeer = TailnetPeer(
+            stableId = "exit-node-1",
+            hostName = "exit-node-1",
+            tailscaleIPs = listOf("100.64.0.55"),
+            online = true,
+            exitNodeOption = true
+        )
+        val plan = ConfigBuilder.build(
+            SingScaleUiState(
+                peers = listOf(subnetRouter, exitPeer),
+                activeExitPeerId = "exit-node-1",
+                policyMode = RoutingPolicyMode.GLOBAL_EXIT
+            ),
+            defaultDeviceHostname = "singscale-mesh-split"
+        )
+        val root = json.parseToJsonElement(plan.configJson).jsonObject
+        val outbounds = root["outbounds"]!!.jsonArray.map { it.jsonObject }
+        val meshSelector = outbounds.first { it["tag"]?.jsonPrimitive?.content == ConfigBuilder.OUTBOUND_MESH }
+        assertEquals("selector", meshSelector["type"]!!.jsonPrimitive.content)
+        assertEquals(listOf(ConfigBuilder.ENDPOINT_TAG), meshSelector["outbounds"]!!.jsonArray.map { it.jsonPrimitive.content })
+
+        val rules = root["route"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
+        val cgnatRule = rules.first { it["ip_cidr"]?.toString()?.contains("100.64.0.0/10") == true }
+        val subnetRule = rules.first { it["ip_cidr"]?.toString()?.contains("198.51.100.0/24") == true }
+        assertEquals(ConfigBuilder.OUTBOUND_MESH, cgnatRule["outbound"]!!.jsonPrimitive.content)
+        assertEquals(ConfigBuilder.OUTBOUND_MESH, subnetRule["outbound"]!!.jsonPrimitive.content)
+        assertEquals(ConfigBuilder.OUTBOUND_SELECTOR, root["route"]!!.jsonObject["final"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `three-way route classification distinguishes tailnet mesh, advertised subnets, native exit, proxy relay, and local direct`() {
+        // Local direct (including egress-select pointing to direct)
+        assertEquals(
+            TrafficRouteCategory.DIRECT,
+            TrafficSplitTracker.classifyRouteCategory(ConfigBuilder.OUTBOUND_DIRECT, listOf(ConfigBuilder.OUTBOUND_DIRECT), "192.0.2.29:443")
+        )
+        assertEquals(
+            TrafficRouteCategory.DIRECT,
+            TrafficSplitTracker.classifyRouteCategory(ConfigBuilder.OUTBOUND_DIRECT, listOf(ConfigBuilder.OUTBOUND_DIRECT, ConfigBuilder.OUTBOUND_SELECTOR), "198.51.100.106:443")
+        )
+
+        // Tailnet Mesh: 100.x, fd7a::, advertised subnet via ts-mesh AND legacy direct ts-ep without egress-select
+        assertEquals(
+            TrafficRouteCategory.TAILNET_MESH,
+            TrafficSplitTracker.classifyRouteCategory(ConfigBuilder.ENDPOINT_TAG, listOf(ConfigBuilder.ENDPOINT_TAG, ConfigBuilder.OUTBOUND_MESH), "100.64.0.51:22")
+        )
+        assertEquals(
+            TrafficRouteCategory.TAILNET_MESH,
+            TrafficSplitTracker.classifyRouteCategory(ConfigBuilder.ENDPOINT_TAG, listOf(ConfigBuilder.ENDPOINT_TAG, ConfigBuilder.OUTBOUND_MESH), "198.51.100.10:80")
+        )
+        assertEquals(
+            TrafficRouteCategory.TAILNET_MESH,
+            TrafficSplitTracker.classifyRouteCategory(ConfigBuilder.ENDPOINT_TAG, listOf(ConfigBuilder.ENDPOINT_TAG), "[fd7a:115c:a1e0::abcd]:443")
+        )
+        assertEquals(
+            TrafficRouteCategory.TAILNET_MESH,
+            TrafficSplitTracker.classifyRouteCategory(ConfigBuilder.ENDPOINT_TAG, listOf(ConfigBuilder.ENDPOINT_TAG), "203.0.113.40:8080")
+        )
+
+        // Relay / Exit: Native Exit via egress-select -> ts-ep, proxy peer-exit, proxy peer-relay
+        assertEquals(
+            TrafficRouteCategory.RELAY_EXIT,
+            TrafficSplitTracker.classifyRouteCategory(ConfigBuilder.ENDPOINT_TAG, listOf(ConfigBuilder.ENDPOINT_TAG, ConfigBuilder.OUTBOUND_SELECTOR), "203.0.113.6:443")
+        )
+        assertEquals(
+            TrafficRouteCategory.RELAY_EXIT,
+            TrafficSplitTracker.classifyRouteCategory(ConfigBuilder.OUTBOUND_EXIT, listOf(ConfigBuilder.OUTBOUND_EXIT, ConfigBuilder.OUTBOUND_SELECTOR), "192.0.2.1:443")
+        )
+        assertEquals(
+            TrafficRouteCategory.RELAY_EXIT,
+            TrafficSplitTracker.classifyRouteCategory(ConfigBuilder.OUTBOUND_RELAY, listOf(ConfigBuilder.OUTBOUND_RELAY, ConfigBuilder.OUTBOUND_SELECTOR), "198.51.100.8:443")
+        )
+
+        // Advertised subnet route connection resolves subnet router peer label & path
+        TrafficSplitTracker.resetSession()
+        val subnetRouter = TailnetPeer(
+            stableId = "office-gw",
+            hostName = "office-gw",
+            tailscaleIPs = listOf("100.64.0.99"),
+            online = true,
+            primaryRoutes = listOf("198.51.100.0/24"),
+            derpRegion = "hkg"
+        )
+        TrafficSplitTracker.ingestSyntheticRecordForTest(
+            TrafficSplitTracker.RawConnData(
+                id = "conn-subnet-1",
+                domain = "",
+                destination = "198.51.100.10:8080",
+                source = "100.64.0.100:50001",
+                network = "TCP",
+                protocol = "HTTP",
+                outboundTag = ConfigBuilder.ENDPOINT_TAG,
+                chain = listOf(ConfigBuilder.ENDPOINT_TAG, ConfigBuilder.OUTBOUND_MESH),
+                rule = "ip_cidr=198.51.100.0/24",
+                createdAtMs = 1_700_000_050_000L,
+                uplinkTotal = 10_000L,
+                downlinkTotal = 40_000L,
+                lastRateAtMs = 1_700_000_050_000L,
+                lastSeenAtMs = 1_700_000_050_000L
+            ),
+            uiState = SingScaleUiState(peers = listOf(subnetRouter))
+        )
+        val snap = TrafficSplitTracker.state.value
+        assertEquals(50_000L, snap.meshTotalBytes)
+        assertEquals(0L, snap.relayTotalBytes)
+        assertEquals(0L, snap.directTotalBytes)
+        val conn = snap.connections.first()
+        assertEquals(TrafficRouteCategory.TAILNET_MESH, conn.routeCategory)
+        assertTrue(conn.routeNodeLabel.contains("office-gw"))
+        assertEquals(TransportPathType.DERP, conn.transportPath)
+    }
+
+    @Test
+    fun `three-way display percentages strictly conserve 100_0 percent across tricky boundary ratios`() {
+        assertEquals(Triple(0, 0, 0), TrafficSplitTracker.computeDisplayTenths(0L, 0L, 0L))
+        assertEquals(Triple("0.0%", "0.0%", "0.0%"), TrafficSplitTracker.computeDisplayPercents(0L, 0L, 0L))
+
+        val cases = listOf(
+            Triple(1L, 1L, 1L),
+            Triple(100L, 0L, 0L),
+            Triple(0L, 100L, 0L),
+            Triple(0L, 0L, 100L),
+            Triple(7L, 13L, 19L),
+            Triple(999_999_999L, 1L, 0L),
+            Triple(333L, 333L, 334L),
+            Triple(2L, 3L, 7L)
+        )
+        for ((r, m, d) in cases) {
+            val (rt, mt, dt) = TrafficSplitTracker.computeDisplayTenths(r, m, d)
+            assertEquals("Sum of tenths must be 1000 for ($r, $m, $d)", 1000, rt + mt + dt)
+            assertTrue(rt in 0..1000 && mt in 0..1000 && dt in 0..1000)
+        }
+    }
+
+    @Test
+    fun `traffic split tracker reconciles kernel evicted totals and archives hot-reload epochs without double counting or dips`() {
+        TrafficSplitTracker.resetSession()
+        val uiState = SingScaleUiState()
+        val now = 1_700_001_000_000L
+
+        // Epoch 1 initial active connections across all 3 buckets
+        val cRelay = TrafficSplitTracker.RawConnData(
+            id = "e1-relay", domain = "github.com", destination = "203.0.113.4:443", source = "100.64.0.1:40001",
+            network = "TCP", protocol = "TLS", outboundTag = ConfigBuilder.ENDPOINT_TAG,
+            chain = listOf(ConfigBuilder.ENDPOINT_TAG, ConfigBuilder.OUTBOUND_SELECTOR), rule = "final",
+            createdAtMs = now, uplinkTotal = 10_000L, downlinkTotal = 90_000L, lastRateAtMs = now, lastSeenAtMs = now
+        )
+        val cMesh = TrafficSplitTracker.RawConnData(
+            id = "e1-mesh", domain = "", destination = "100.64.0.2:22", source = "100.64.0.1:40002",
+            network = "TCP", protocol = "SSH", outboundTag = ConfigBuilder.ENDPOINT_TAG,
+            chain = listOf(ConfigBuilder.ENDPOINT_TAG, ConfigBuilder.OUTBOUND_MESH), rule = "ip_cidr=100.64.0.0/10",
+            createdAtMs = now, uplinkTotal = 20_000L, downlinkTotal = 30_000L, lastRateAtMs = now, lastSeenAtMs = now
+        )
+        val cDirect = TrafficSplitTracker.RawConnData(
+            id = "e1-direct", domain = "example.com", destination = "192.0.2.55:443", source = "100.64.0.1:40003",
+            network = "TCP", protocol = "TLS", outboundTag = ConfigBuilder.OUTBOUND_DIRECT,
+            chain = listOf(ConfigBuilder.OUTBOUND_DIRECT), rule = "direct",
+            createdAtMs = now, uplinkTotal = 5_000L, downlinkTotal = 45_000L, lastRateAtMs = now, lastSeenAtMs = now
+        )
+        TrafficSplitTracker.ingestSyntheticRecordForTest(cRelay, uiState, instanceEpoch = 1)
+        TrafficSplitTracker.ingestSyntheticRecordForTest(cMesh, uiState, instanceEpoch = 1)
+        TrafficSplitTracker.ingestSyntheticRecordForTest(cDirect, uiState, instanceEpoch = 1)
+
+        // Simulate background -> foreground stream reconnect on SAME epoch 1 where cMesh was already evicted from closed ring
+        TrafficSplitTracker.simulateResetBatchForTest(
+            newRecords = listOf(cRelay.copy(downlinkTotal = 110_000L), cDirect),
+            uiState = uiState,
+            instanceEpoch = 1,
+            nowMs = now + 2000L
+        )
+        val afterReconnect = TrafficSplitTracker.state.value
+        // Monotonic floor prevents mesh bytes from dipping to 0 before kernel sync arrives!
+        assertEquals(50_000L, afterReconnect.meshTotalBytes)
+        assertEquals(120_000L, afterReconnect.relayTotalBytes)
+        assertEquals(50_000L, afterReconnect.directTotalBytes)
+
+        // Kernel reconciliation reports additional evicted bytes accumulated while app was in background
+        TrafficSplitTracker.reconcileKernelTotals(
+            kernelSplit = KernelTrafficSplit(
+                direct = KernelBucketTotals(uplinkBytes = 15_000L, downlinkBytes = 85_000L, activeConnections = 1, totalConnections = 12),
+                mesh = KernelBucketTotals(uplinkBytes = 40_000L, downlinkBytes = 160_000L, activeConnections = 0, totalConnections = 5),
+                relay = KernelBucketTotals(uplinkBytes = 30_000L, downlinkBytes = 270_000L, activeConnections = 1, totalConnections = 20)
+            ),
+            uiState = uiState,
+            instanceEpoch = 1
+        )
+        val afterReconcile = TrafficSplitTracker.state.value
+        assertEquals(100_000L, afterReconcile.directTotalBytes)
+        assertEquals(200_000L, afterReconcile.meshTotalBytes)
+        assertEquals(300_000L, afterReconcile.relayTotalBytes)
+        assertEquals(600_000L, afterReconcile.combinedBytes)
+        assertEquals(12, afterReconcile.totalDirectConnections)
+        assertEquals(5, afterReconcile.totalMeshConnections)
+        assertEquals(20, afterReconcile.totalRelayConnections)
+
+        // Hot-reload to epoch 2 archives epoch 1 cleanly and adds new epoch 2 traffic without double counting
+        val e2Mesh = TrafficSplitTracker.RawConnData(
+            id = "e2-mesh", domain = "", destination = "100.64.0.9:5555", source = "100.64.0.1:50009",
+            network = "TCP", protocol = "", outboundTag = ConfigBuilder.ENDPOINT_TAG,
+            chain = listOf(ConfigBuilder.ENDPOINT_TAG, ConfigBuilder.OUTBOUND_MESH), rule = "ip_cidr=100.64.0.0/10",
+            createdAtMs = now + 5000L, uplinkTotal = 10_000L, downlinkTotal = 40_000L, lastRateAtMs = now + 5000L, lastSeenAtMs = now + 5000L
+        )
+        TrafficSplitTracker.simulateResetBatchForTest(
+            newRecords = listOf(e2Mesh),
+            uiState = uiState,
+            instanceEpoch = 2,
+            nowMs = now + 5000L
+        )
+        val afterEpoch2 = TrafficSplitTracker.state.value
+        assertEquals(100_000L, afterEpoch2.directTotalBytes)
+        assertEquals(250_000L, afterEpoch2.meshTotalBytes)
+        assertEquals(300_000L, afterEpoch2.relayTotalBytes)
+        assertEquals(650_000L, afterEpoch2.combinedBytes)
+        assertEquals(6, afterEpoch2.totalMeshConnections)
+    }
+
+    @Test
+    fun `legacy v1_0_4 persisted settings JSON deserializes cleanly with full backward compatibility`() {
+        val legacyV104Json = """
+            {
+              "selectedExitPeerId": "node-exit-01",
+              "selectedRelayPeerId": "node-relay-02",
+              "smartAutoSelectNode": false,
+              "policyMode": "SMART_QUALITY",
+              "thresholds": {
+                "probeIntervalSec": 15,
+                "directFirstPreferred": true,
+                "directAcceptableLatencyMs": 300,
+                "allowTailnetInboundLocalForward": true,
+                "customDirectDomains": ["cn", "baidu.com", "qq.com", "taobao.com", "bilibili.com", "163.com"],
+                "customProxyDomains": ["google.com", "github.com", "youtube.com", "openai.com", "anthropic.com", "wikipedia.org"],
+                "deprecatedLegacyFlag": true
+              },
+              "rulesMigratedV2": false,
+              "powerMigratedV3": false,
+              "hasSavedLogin": true,
+              "cachedTailnetName": "example.ts.net",
+              "cachedSelfName": "android-device",
+              "cachedSelfIp": "100.64.0.100",
+              "cachedSelfIpv6": "fd7a:115c:a1e0::abc1",
+              "cachedPeers": [
+                {
+                  "stableId": "node-exit-01",
+                  "hostName": "exit-node-1",
+                  "tailscaleIPs": ["100.64.0.50"],
+                  "online": true,
+                  "active": true,
+                  "exitNodeOption": true,
+                  "curAddr": "203.0.113.50:41641",
+                  "rxBytes": 12345,
+                  "txBytes": 6789
+                }
+              ],
+              "unknownFutureField": "should-be-ignored"
+            }
+        """.trimIndent()
+
+        val decoded = SingScaleRepository.decodePersistedSettings(legacyV104Json)
+        val hydrated = SingScaleRepository.hydrateStateFromPersisted(
+            base = SingScaleUiState(),
+            saved = decoded,
+            diskHasLogin = true
+        )
+
+        assertEquals("node-exit-01", hydrated.selectedExitPeerId)
+        assertEquals("node-relay-02", hydrated.selectedRelayPeerId)
+        assertFalse(hydrated.smartAutoSelectNode)
+        assertEquals("example.ts.net", hydrated.tailnetName)
+        assertEquals("100.64.0.100", hydrated.selfPeer?.primaryIpv4)
+        assertEquals(1, hydrated.peers.size)
+        // Cached peers start offline/inactive until live sync confirms reachability
+        assertFalse(hydrated.peers[0].online)
+        assertFalse(hydrated.peers[0].active)
+        assertEquals(TransportPathType.DIRECT, hydrated.peers[0].effectivePathType)
+        // v2 & v3 threshold migrations still apply cleanly
+        assertEquals(emptyList<String>(), hydrated.thresholds.customDirectDomains)
+        assertEquals(emptyList<String>(), hydrated.thresholds.customProxyDomains)
+        assertEquals(220, hydrated.thresholds.directAcceptableLatencyMs)
+        assertEquals(45, hydrated.thresholds.probeIntervalSec)
+        assertTrue(hydrated.thresholds.allowTailnetInboundLocalForward)
     }
 }

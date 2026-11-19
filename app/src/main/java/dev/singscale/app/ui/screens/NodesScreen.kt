@@ -76,6 +76,8 @@ import dev.singscale.app.core.PeerGatewayMode
 import dev.singscale.app.core.SingScaleRepository
 import dev.singscale.app.core.SingScaleUiState
 import dev.singscale.app.core.TailnetPeer
+import dev.singscale.app.core.TrafficFormat
+import dev.singscale.app.core.TransportPathType
 import dev.singscale.app.core.TunnelStatus
 import dev.singscale.app.service.SingScaleVpnService
 import dev.singscale.app.ui.components.GlassCard
@@ -85,6 +87,7 @@ import dev.singscale.app.ui.components.MicroPillBadge
 import dev.singscale.app.ui.components.QualityScoreRing
 import dev.singscale.app.ui.components.SparklineChart
 import dev.singscale.app.ui.components.singScaleSwitchColors
+import dev.singscale.app.ui.theme.AmberWarn
 import dev.singscale.app.ui.theme.CyanBright
 import dev.singscale.app.ui.theme.CyanPrimary
 import dev.singscale.app.ui.theme.EmeraldGood
@@ -436,10 +439,16 @@ private fun CompactAutoPilotCard(
         else -> "${state.onlinePeersCount} 台在线 · 公网本地直连"
     }
 
+    val onlinePeers = remember(state.peers) { state.peers.filter { it.online && !it.expired } }
+    val p2pDirectCount = remember(onlinePeers) { onlinePeers.count { it.effectivePathType == TransportPathType.DIRECT } }
+    val peerRelayCount = remember(onlinePeers) { onlinePeers.count { it.effectivePathType == TransportPathType.PEER_RELAY } }
+    val derpRelayCount = remember(onlinePeers) { onlinePeers.count { it.effectivePathType == TransportPathType.DERP } }
+
     GlassCard(
         cornerRadius = 20.dp,
         accentTint = if (fullAutoActive) CyanPrimary else null,
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -481,6 +490,38 @@ private fun CompactAutoPilotCard(
                 colors = singScaleSwitchColors()
             )
         }
+
+        if (onlinePeers.isNotEmpty()) {
+            HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.55f))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                PathSummaryDot("P2P直连 $p2pDirectCount", EmeraldGood)
+                PathSummaryDot("节点中继 $peerRelayCount", CyanPrimary)
+                PathSummaryDot("DERP中转 $derpRelayCount", AmberWarn)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PathSummaryDot(text: String, color: Color) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier
+                .size(6.dp)
+                .clip(CircleShape)
+                .background(color)
+        )
+        Spacer(modifier = Modifier.width(5.dp))
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+            color = TextSecondary,
+            maxLines = 1
+        )
     }
 }
 
@@ -575,9 +616,17 @@ private fun ExpandablePeerCard(
 
             Spacer(modifier = Modifier.width(8.dp))
 
+            val pathType = peer.effectivePathType
             if (peer.quality.reachable && peer.quality.latencyMs > 0) {
                 MicroPillBadge(
-                    text = "${peer.quality.latencyMs.roundToInt()} ms",
+                    text = "${pathType.shortLabel} · ${peer.quality.latencyMs.roundToInt()}ms",
+                    color = pathAccent,
+                    filled = isActiveExit || isActiveRelay
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+            } else if (peer.online && pathType != TransportPathType.OFFLINE) {
+                MicroPillBadge(
+                    text = pathType.shortLabel,
                     color = pathAccent,
                     filled = isActiveExit || isActiveRelay
                 )
@@ -620,20 +669,40 @@ private fun ExpandablePeerCard(
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
+                        val pathDetail = when (peer.effectivePathType) {
+                            TransportPathType.DIRECT -> peer.curAddr.ifBlank { peer.quality.endpoint }
+                            TransportPathType.PEER_RELAY -> peer.peerRelay.ifBlank { peer.quality.peerRelay }
+                            TransportPathType.DERP -> peer.derpRegion.ifBlank { peer.quality.derpRegion }
+                            TransportPathType.OFFLINE -> ""
+                        }
+                        val pathHeader = if (pathDetail.isNotBlank()) {
+                            "${peer.effectivePathType.label} ($pathDetail)"
+                        } else {
+                            peer.effectivePathType.label
+                        }
                         Text(
-                            text = "${peer.effectivePathType.label} · ${peer.exitCapabilityBadge}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = TextPrimary,
+                            text = pathHeader,
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                            color = pathAccent,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
                         Text(
-                            text = "中继：${peer.relayCapabilityBadge}",
+                            text = "出口：${peer.exitCapabilityBadge} · 中继：${peer.relayCapabilityBadge}",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextSecondary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        if (peer.totalPeerBytes > 0L) {
+                            Text(
+                                text = "组网流量：↓ ${TrafficFormat.formatBytes(peer.rxBytes)} / ↑ ${TrafficFormat.formatBytes(peer.txBytes)}",
+                                style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                                color = TextMuted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                     if (peer.quality.history.isNotEmpty()) {
                         Spacer(modifier = Modifier.width(8.dp))

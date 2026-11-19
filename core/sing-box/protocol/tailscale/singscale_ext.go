@@ -79,6 +79,7 @@ type singScalePeerEntry struct {
 	CurAddr         string   `json:"curAddr"`
 	PeerRelay       string   `json:"peerRelay"`
 	DERPRegion      string   `json:"derpRegion"`
+	PathType        string   `json:"pathType,omitempty"`
 	Addrs           []string `json:"addrs,omitempty"`
 	PrimaryRoutes   []string `json:"primaryRoutes,omitempty"`
 	AllowedIPs      []string `json:"allowedIPs,omitempty"`
@@ -229,6 +230,7 @@ func convertDetailedPeer(peer *ipnstate.PeerStatus, users map[tailcfg.UserID]tai
 	if !peer.LastHandshake.IsZero() {
 		lastHandshake = peer.LastHandshake.Unix()
 	}
+	pathType := classifyPeerTransportPath(peer)
 	return singScalePeerEntry{
 		StableID:        string(peer.ID),
 		HostName:        peer.HostName,
@@ -246,6 +248,7 @@ func convertDetailedPeer(peer *ipnstate.PeerStatus, users map[tailcfg.UserID]tai
 		CurAddr:         peer.CurAddr,
 		PeerRelay:       peer.PeerRelay,
 		DERPRegion:      peer.Relay,
+		PathType:        pathType,
 		Addrs:           peer.Addrs,
 		PrimaryRoutes:   primaryRoutes,
 		AllowedIPs:      allowedIPs,
@@ -254,6 +257,22 @@ func convertDetailedPeer(peer *ipnstate.PeerStatus, users map[tailcfg.UserID]tai
 		TxBytes:         peer.TxBytes,
 		LastSeen:        lastSeen,
 		LastHandshake:   lastHandshake,
+	}
+}
+
+func classifyPeerTransportPath(peer *ipnstate.PeerStatus) string {
+	if peer == nil {
+		return "OFFLINE"
+	}
+	switch {
+	case strings.TrimSpace(peer.CurAddr) != "":
+		return "DIRECT"
+	case strings.TrimSpace(peer.PeerRelay) != "":
+		return "PEER_RELAY"
+	case strings.TrimSpace(peer.Relay) != "" && peer.Online:
+		return "DERP"
+	default:
+		return "OFFLINE"
 	}
 }
 

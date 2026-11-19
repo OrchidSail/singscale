@@ -13,11 +13,15 @@ enum class TunnelStatus {
 }
 
 @Serializable
-enum class TransportPathType(val label: String, val badge: String) {
-    DIRECT("P2P 直连", "DIRECT"),
-    PEER_RELAY("节点中继", "RELAY"),
-    DERP("DERP 中转", "DERP"),
-    OFFLINE("离线 / 未知", "IDLE")
+enum class TransportPathType(
+    val label: String,
+    val badge: String,
+    val shortLabel: String
+) {
+    DIRECT("P2P 直连", "DIRECT", "P2P"),
+    PEER_RELAY("节点中继", "RELAY", "中继"),
+    DERP("DERP 中转", "DERP", "DERP"),
+    OFFLINE("离线 / 未知", "IDLE", "离线")
 }
 
 @Serializable
@@ -161,12 +165,17 @@ data class TailnetPeer(
 
     val effectivePathType: TransportPathType
         get() = when {
+            active && curAddr.isNotBlank() -> TransportPathType.DIRECT
+            active && peerRelay.isNotBlank() -> TransportPathType.PEER_RELAY
             quality.updatedAtMs > 0L && quality.reachable -> quality.pathType
             curAddr.isNotBlank() -> TransportPathType.DIRECT
             peerRelay.isNotBlank() -> TransportPathType.PEER_RELAY
             derpRegion.isNotBlank() && online -> TransportPathType.DERP
             else -> TransportPathType.OFFLINE
         }
+
+    val totalPeerBytes: Long
+        get() = rxBytes.coerceAtLeast(0L) + txBytes.coerceAtLeast(0L)
 
     val subnetRoutes: List<String>
         get() = (primaryRoutes + allowedIPs)

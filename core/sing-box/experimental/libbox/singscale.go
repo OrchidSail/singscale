@@ -2,6 +2,7 @@ package libbox
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -203,4 +204,17 @@ func (s *CommandServer) SingScaleSetInboundLocalForward(endpointTag string, enab
 		return
 	}
 	tsEp.SingScaleSetInboundLocalForward(enabled)
+}
+
+func (s *CommandServer) SingScaleGetTrafficSplitJSON() (string, error) {
+	instance := s.StartedService.Instance()
+	if instance == nil || instance.TrafficManager() == nil {
+		return "", E.New("sing-box traffic manager is not running")
+	}
+	split := instance.TrafficManager().SingScaleTrafficSplit()
+	encoded, err := json.Marshal(split)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }

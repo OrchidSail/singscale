@@ -2,6 +2,7 @@ package trafficcontrol
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -40,6 +41,8 @@ type Manager struct {
 	closedConnections       list.List[TrackerMetadata]
 	closedUploadTotal       int64
 	closedDownloadTotal     int64
+	evictedBuckets          [singScaleBucketCount]singScaleEvictedBucket
+	totalConnsByBucket      [singScaleBucketCount]atomic.Int64
 
 	eventSubscriber *observable.Subscriber[ConnectionEvent]
 	eventObserver   *observable.Observer[ConnectionEvent]
@@ -78,6 +81,7 @@ func (m *Manager) UnSubscribeEvents(subscription observable.Subscription[Connect
 
 func (m *Manager) join(tracker Tracker) {
 	metadata := tracker.Metadata()
+	m.totalConnsByBucket[classifyTrackerMetadata(metadata)].Add(1)
 	m.connections.Store(metadata.ID, tracker)
 	m.eventSubscriber.Emit(ConnectionEvent{
 		Type:     ConnectionEventNew,
@@ -99,8 +103,13 @@ func (m *Manager) leave(tracker Tracker) {
 	metadataCopy := *metadata
 	if m.closedConnections.Len() >= closedConnectionsLimit {
 		evicted := m.closedConnections.PopFront()
-		m.closedUploadTotal += evicted.Upload.Load()
-		m.closedDownloadTotal += evicted.Download.Load()
+		evictedUp := evicted.Upload.Load()
+		evictedDown := evicted.Download.Load()
+		m.closedUploadTotal += evictedUp
+		m.closedDownloadTotal += evictedDown
+		bucket := classifyTrackerMetadata(&evicted)
+		m.evictedBuckets[bucket].uplinkBytes += evictedUp
+		m.evictedBuckets[bucket].downlinkBytes += evictedDown
 	}
 	m.closedConnections.PushBack(metadataCopy)
 	m.closedConnectionsAccess.Unlock()
@@ -176,8 +185,13 @@ func (m *Manager) Clear() {
 	m.closedConnectionsAccess.Lock()
 	defer m.closedConnectionsAccess.Unlock()
 	for element := m.closedConnections.Front(); element != nil; element = element.Next() {
-		m.closedUploadTotal += element.Value.Upload.Load()
-		m.closedDownloadTotal += element.Value.Download.Load()
+		evictedUp := element.Value.Upload.Load()
+		evictedDown := element.Value.Download.Load()
+		m.closedUploadTotal += evictedUp
+		m.closedDownloadTotal += evictedDown
+		bucket := classifyTrackerMetadata(&element.Value)
+		m.evictedBuckets[bucket].uplinkBytes += evictedUp
+		m.evictedBuckets[bucket].downlinkBytes += evictedDown
 	}
 	m.closedConnections.Init()
 }

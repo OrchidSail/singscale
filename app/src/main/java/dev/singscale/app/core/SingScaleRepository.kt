@@ -41,7 +41,7 @@ object SingScaleRepository {
     private val v1LegacyProxyDefaults = setOf("google.com", "github.com", "youtube.com", "openai.com", "anthropic.com", "wikipedia.org")
 
     @Serializable
-    private data class PersistedSettings(
+    internal data class PersistedSettings(
         val selectedExitPeerId: String = "",
         val selectedRelayPeerId: String = "",
         val smartAutoSelectNode: Boolean = true,
@@ -60,6 +60,71 @@ object SingScaleRepository {
         val cachedPeers: List<TailnetPeer> = emptyList()
     )
 
+    internal fun decodePersistedSettings(raw: String): PersistedSettings =
+        json.decodeFromString(raw)
+
+    internal fun hydrateStateFromPersisted(
+        base: SingScaleUiState,
+        saved: PersistedSettings,
+        diskHasLogin: Boolean
+    ): SingScaleUiState {
+        val validCachedV4 = ConfigBuilder.normalizeTailscaleIpv4(saved.cachedSelfIp)
+        val validCachedV6 = ConfigBuilder.normalizeTailscaleIpv6(saved.cachedSelfIpv6)
+        val cachedSelfIps = listOfNotNull(validCachedV4, validCachedV6)
+        val cachedSelf = if (diskHasLogin && (saved.cachedSelfName.isNotBlank() || cachedSelfIps.isNotEmpty())) {
+            TailnetPeer(
+                stableId = "cached-self",
+                hostName = saved.cachedSelfName,
+                tailscaleIPs = cachedSelfIps
+            )
+        } else null
+        val v2Thresholds = if (!saved.rulesMigratedV2) {
+            val cleanedDirect = if (saved.thresholds.customDirectDomains.toSet() == v1LegacyDirectDefaults) {
+                emptyList()
+            } else {
+                saved.thresholds.customDirectDomains
+            }
+            val cleanedProxy = if (saved.thresholds.customProxyDomains.toSet() == v1LegacyProxyDefaults) {
+                emptyList()
+            } else {
+                saved.thresholds.customProxyDomains
+            }
+            val adjustedLatency = if (saved.thresholds.directAcceptableLatencyMs == 300) 220 else saved.thresholds.directAcceptableLatencyMs
+            saved.thresholds.copy(
+                customDirectDomains = cleanedDirect,
+                customProxyDomains = cleanedProxy,
+                directAcceptableLatencyMs = adjustedLatency
+            )
+        } else {
+            saved.thresholds
+        }
+        val migratedThresholds = if (!saved.powerMigratedV3 && v2Thresholds.probeIntervalSec <= 15) {
+            v2Thresholds.copy(probeIntervalSec = 45)
+        } else {
+            v2Thresholds
+        }
+        return base.copy(
+            selectedExitPeerId = saved.selectedExitPeerId,
+            selectedRelayPeerId = saved.selectedRelayPeerId,
+            activeExitPeerId = saved.selectedExitPeerId,
+            activeRelayPeerId = saved.selectedRelayPeerId,
+            smartAutoSelectNode = saved.smartAutoSelectNode,
+            policyMode = saved.policyMode,
+            thresholds = migratedThresholds,
+            authConfig = saved.authConfig,
+            peerConfigs = saved.peerConfigs,
+            hasSavedLogin = diskHasLogin,
+            tailnetName = if (diskHasLogin) saved.cachedTailnetName else "",
+            selfPeer = cachedSelf,
+            peers = if (diskHasLogin) saved.cachedPeers.map { p -> p.copy(online = false, active = false) } else emptyList(),
+            statusMessage = if (diskHasLogin && saved.cachedTailnetName.isNotBlank()) {
+                "已就绪 (${saved.cachedTailnetName}) · 点击一键开启组网"
+            } else {
+                base.statusMessage
+            }
+        )
+    }
+
     fun init(context: Context) {
         if (appContext != null) return
         val ctx = context.applicationContext
@@ -69,65 +134,10 @@ object SingScaleRepository {
         val raw = prefs.getString(KEY_PERSISTED, null)
         if (!raw.isNullOrBlank()) {
             runCatching {
-                val saved = json.decodeFromString<PersistedSettings>(raw)
+                val saved = decodePersistedSettings(raw)
                 val validCachedV4 = ConfigBuilder.normalizeTailscaleIpv4(saved.cachedSelfIp)
-                val validCachedV6 = ConfigBuilder.normalizeTailscaleIpv6(saved.cachedSelfIpv6)
-                val cachedSelfIps = listOfNotNull(validCachedV4, validCachedV6)
-                val cachedSelf = if (diskHasLogin && (saved.cachedSelfName.isNotBlank() || cachedSelfIps.isNotEmpty())) {
-                    TailnetPeer(
-                        stableId = "cached-self",
-                        hostName = saved.cachedSelfName,
-                        tailscaleIPs = cachedSelfIps
-                    )
-                } else null
                 lastPersistedSelfIp = if (diskHasLogin) validCachedV4.orEmpty() else ""
-                val v2Thresholds = if (!saved.rulesMigratedV2) {
-                    val cleanedDirect = if (saved.thresholds.customDirectDomains.toSet() == v1LegacyDirectDefaults) {
-                        emptyList()
-                    } else {
-                        saved.thresholds.customDirectDomains
-                    }
-                    val cleanedProxy = if (saved.thresholds.customProxyDomains.toSet() == v1LegacyProxyDefaults) {
-                        emptyList()
-                    } else {
-                        saved.thresholds.customProxyDomains
-                    }
-                    val adjustedLatency = if (saved.thresholds.directAcceptableLatencyMs == 300) 220 else saved.thresholds.directAcceptableLatencyMs
-                    saved.thresholds.copy(
-                        customDirectDomains = cleanedDirect,
-                        customProxyDomains = cleanedProxy,
-                        directAcceptableLatencyMs = adjustedLatency
-                    )
-                } else {
-                    saved.thresholds
-                }
-                val migratedThresholds = if (!saved.powerMigratedV3 && v2Thresholds.probeIntervalSec <= 15) {
-                    v2Thresholds.copy(probeIntervalSec = 45)
-                } else {
-                    v2Thresholds
-                }
-                _state.update {
-                    it.copy(
-                        selectedExitPeerId = saved.selectedExitPeerId,
-                        selectedRelayPeerId = saved.selectedRelayPeerId,
-                        activeExitPeerId = saved.selectedExitPeerId,
-                        activeRelayPeerId = saved.selectedRelayPeerId,
-                        smartAutoSelectNode = saved.smartAutoSelectNode,
-                        policyMode = saved.policyMode,
-                        thresholds = migratedThresholds,
-                        authConfig = saved.authConfig,
-                        peerConfigs = saved.peerConfigs,
-                        hasSavedLogin = diskHasLogin,
-                        tailnetName = if (diskHasLogin) saved.cachedTailnetName else "",
-                        selfPeer = cachedSelf,
-                        peers = if (diskHasLogin) saved.cachedPeers.map { p -> p.copy(online = false, active = false) } else emptyList(),
-                        statusMessage = if (diskHasLogin && saved.cachedTailnetName.isNotBlank()) {
-                            "已就绪 (${saved.cachedTailnetName}) · 点击一键开启组网"
-                        } else {
-                            it.statusMessage
-                        }
-                    )
-                }
+                _state.update { hydrateStateFromPersisted(it, saved, diskHasLogin) }
             }
         } else if (diskHasLogin) {
             _state.update {

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/tailscale/ipn/ipnstate"
 )
 
 func TestSingScaleEndpointConcurrentTeardownNilSafety(t *testing.T) {
@@ -45,5 +46,23 @@ func TestSingScaleEndpointConcurrentTeardownNilSafety(t *testing.T) {
 	ep.InterfaceUpdated(ctx)
 	if ep.PreferredAddress(&adapter.InboundContext{}, netip.MustParseAddr("100.64.0.1")) {
 		t.Fatal("expected false PreferredAddress when backend is nil")
+	}
+}
+
+func TestClassifyPeerTransportPathSeparatesDirectPeerRelayAndDERP(t *testing.T) {
+	if got := classifyPeerTransportPath(&ipnstate.PeerStatus{Online: true, CurAddr: "203.0.113.1:41641", Relay: "hkg"}); got != "DIRECT" {
+		t.Fatalf("expected DIRECT when CurAddr is set, got %q", got)
+	}
+	if got := classifyPeerTransportPath(&ipnstate.PeerStatus{Online: true, PeerRelay: "198.51.100.2:41641:vni:1", Relay: "hkg"}); got != "PEER_RELAY" {
+		t.Fatalf("expected PEER_RELAY when PeerRelay is set without CurAddr, got %q", got)
+	}
+	if got := classifyPeerTransportPath(&ipnstate.PeerStatus{Online: true, Relay: "hkg"}); got != "DERP" {
+		t.Fatalf("expected DERP when online with only DERP relay, got %q", got)
+	}
+	if got := classifyPeerTransportPath(&ipnstate.PeerStatus{Online: false, Relay: "hkg"}); got != "OFFLINE" {
+		t.Fatalf("expected OFFLINE when peer is offline without direct endpoint, got %q", got)
+	}
+	if got := classifyPeerTransportPath(nil); got != "OFFLINE" {
+		t.Fatalf("expected OFFLINE for nil peer, got %q", got)
 	}
 }

@@ -86,6 +86,7 @@ import dev.singscale.app.core.TrafficFormat
 import dev.singscale.app.core.TrafficRouteCategory
 import dev.singscale.app.core.TrafficSplitSnapshot
 import dev.singscale.app.core.TrafficSplitTracker
+import dev.singscale.app.core.TransportPathType
 import dev.singscale.app.service.SingScaleVpnService
 import dev.singscale.app.ui.components.DualTrafficSparkline
 import dev.singscale.app.ui.components.GlassCard
@@ -114,7 +115,7 @@ import java.util.Locale
 import kotlin.math.max
 
 private enum class InspectorSubTab { DOMAINS, CONNECTIONS }
-private enum class RouteFilterMode { ALL, RELAY_ONLY, DIRECT_ONLY }
+private enum class RouteFilterMode { ALL, RELAY_ONLY, MESH_ONLY, DIRECT_ONLY }
 private enum class DomainSortMode(val label: String) {
     BY_BYTES("流量 ↓"),
     BY_SPEED("速率 ↓"),
@@ -155,8 +156,9 @@ fun TrafficInspectorScreen(state: SingScaleUiState) {
         val base = split.domains.filter { item ->
             val passRoute = when (routeFilter) {
                 RouteFilterMode.ALL -> true
-                RouteFilterMode.RELAY_ONLY -> item.primaryCategory.isTunnelRouted
-                RouteFilterMode.DIRECT_ONLY -> !item.primaryCategory.isTunnelRouted
+                RouteFilterMode.RELAY_ONLY -> item.primaryCategory == TrafficRouteCategory.RELAY_EXIT
+                RouteFilterMode.MESH_ONLY -> item.primaryCategory == TrafficRouteCategory.TAILNET_MESH
+                RouteFilterMode.DIRECT_ONLY -> item.primaryCategory == TrafficRouteCategory.DIRECT
             }
             val passQuery = normalizedQuery.isEmpty() ||
                 item.host.lowercase().contains(normalizedQuery) ||
@@ -183,14 +185,37 @@ fun TrafficInspectorScreen(state: SingScaleUiState) {
         split.connections.filter { conn ->
             val passRoute = when (routeFilter) {
                 RouteFilterMode.ALL -> true
-                RouteFilterMode.RELAY_ONLY -> conn.routeCategory.isTunnelRouted
-                RouteFilterMode.DIRECT_ONLY -> !conn.routeCategory.isTunnelRouted
+                RouteFilterMode.RELAY_ONLY -> conn.routeCategory == TrafficRouteCategory.RELAY_EXIT
+                RouteFilterMode.MESH_ONLY -> conn.routeCategory == TrafficRouteCategory.TAILNET_MESH
+                RouteFilterMode.DIRECT_ONLY -> conn.routeCategory == TrafficRouteCategory.DIRECT
             }
             val passQuery = normalizedQuery.isEmpty() ||
                 conn.effectiveHost.lowercase().contains(normalizedQuery) ||
                 conn.destination.lowercase().contains(normalizedQuery) ||
                 conn.routeNodeLabel.lowercase().contains(normalizedQuery)
             passRoute && passQuery
+        }
+    }
+
+    val relayItemCount = remember(subTab, split.domains, split.connections) {
+        if (subTab == InspectorSubTab.DOMAINS) {
+            split.domains.count { it.primaryCategory == TrafficRouteCategory.RELAY_EXIT }
+        } else {
+            split.connections.count { it.routeCategory == TrafficRouteCategory.RELAY_EXIT }
+        }
+    }
+    val meshItemCount = remember(subTab, split.domains, split.connections) {
+        if (subTab == InspectorSubTab.DOMAINS) {
+            split.domains.count { it.primaryCategory == TrafficRouteCategory.TAILNET_MESH }
+        } else {
+            split.connections.count { it.routeCategory == TrafficRouteCategory.TAILNET_MESH }
+        }
+    }
+    val directItemCount = remember(subTab, split.domains, split.connections) {
+        if (subTab == InspectorSubTab.DOMAINS) {
+            split.domains.count { it.primaryCategory == TrafficRouteCategory.DIRECT }
+        } else {
+            split.connections.count { it.routeCategory == TrafficRouteCategory.DIRECT }
         }
     }
 
@@ -307,14 +332,21 @@ fun TrafficInspectorScreen(state: SingScaleUiState) {
                         onClick = { filterOrdinal = RouteFilterMode.ALL.ordinal }
                     )
                     GlassFilterPill(
-                        label = "中继/出口",
+                        label = if (relayItemCount > 0) "中继/出口 $relayItemCount" else "中继/出口",
                         selected = routeFilter == RouteFilterMode.RELAY_ONLY,
                         accent = EmeraldGood,
                         leadingDotColor = EmeraldGood,
                         onClick = { filterOrdinal = RouteFilterMode.RELAY_ONLY.ordinal }
                     )
                     GlassFilterPill(
-                        label = "本地直连",
+                        label = if (meshItemCount > 0) "组网直连 $meshItemCount" else "组网直连",
+                        selected = routeFilter == RouteFilterMode.MESH_ONLY,
+                        accent = IndigoAccent,
+                        leadingDotColor = IndigoAccent,
+                        onClick = { filterOrdinal = RouteFilterMode.MESH_ONLY.ordinal }
+                    )
+                    GlassFilterPill(
+                        label = if (directItemCount > 0) "本地直连 $directItemCount" else "本地直连",
                         selected = routeFilter == RouteFilterMode.DIRECT_ONLY,
                         accent = AmberWarn,
                         leadingDotColor = AmberWarn,
@@ -327,7 +359,7 @@ fun TrafficInspectorScreen(state: SingScaleUiState) {
                         GlassFilterPill(
                             label = sortMode.label,
                             selected = true,
-                            accent = IndigoAccent,
+                            accent = CyanPrimary,
                             onClick = {
                                 sortOrdinal = (sortOrdinal + 1) % DomainSortMode.entries.size
                             }
@@ -441,8 +473,10 @@ private fun CompactSplitHeaderCard(
     ) {
         SplitRatioProgressBar(
             relayBytes = split.relayTotalBytes,
+            meshBytes = split.meshTotalBytes,
             directBytes = split.directTotalBytes,
             relayBps = split.relayTotalBps,
+            meshBps = split.meshTotalBps,
             directBps = split.directTotalBps
         )
 
@@ -452,26 +486,21 @@ private fun CompactSplitHeaderCard(
                 .height(IntrinsicSize.Min),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "中继 / 出口 ($activeNodeTitle)",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                MetricValueText(
-                    formatted = if (split.relayDownBps > 0L) {
-                        TrafficFormat.formatBps(split.relayDownBps)
-                    } else {
-                        TrafficFormat.formatBytes(split.relayTotalBytes)
-                    },
-                    prefix = if (split.relayDownBps > 0L) "↓ " else "",
-                    numberSize = 19.sp,
-                    unitSize = 11.sp,
-                    prefixColor = EmeraldGood
-                )
-            }
+            InspectorBucketColumn(
+                title = "中继/出口",
+                accent = EmeraldGood,
+                downBps = split.relayDownBps,
+                upBps = split.relayUpBps,
+                totalBytes = split.relayTotalBytes,
+                downBytes = split.relayDownBytes,
+                upBytes = split.relayUpBytes,
+                activeConns = split.activeRelayConnections,
+                totalConns = split.totalRelayConnections,
+                idleHint = activeNodeTitle,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp)
+            )
 
             Box(
                 modifier = Modifier
@@ -481,26 +510,75 @@ private fun CompactSplitHeaderCard(
                     .background(ObsidianBorder)
             )
 
-            Column(
+            InspectorBucketColumn(
+                title = "组网直连",
+                accent = IndigoAccent,
+                downBps = split.meshDownBps,
+                upBps = split.meshUpBps,
+                totalBytes = split.meshTotalBytes,
+                downBytes = split.meshDownBytes,
+                upBytes = split.meshUpBytes,
+                activeConns = split.activeMeshConnections,
+                totalConns = split.totalMeshConnections,
+                idleHint = "100.x 内网",
                 modifier = Modifier
                     .weight(1f)
-                    .padding(start = 16.dp)
+                    .padding(horizontal = 8.dp)
+            )
+
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .fillMaxHeight()
+                    .padding(vertical = 2.dp)
+                    .background(ObsidianBorder)
+            )
+
+            InspectorBucketColumn(
+                title = "本地直连",
+                accent = AmberWarn,
+                downBps = split.directDownBps,
+                upBps = split.directUpBps,
+                totalBytes = split.directTotalBytes,
+                downBytes = split.directDownBytes,
+                upBytes = split.directUpBytes,
+                activeConns = split.activeDirectConnections,
+                totalConns = split.totalDirectConnections,
+                idleHint = "物理网卡",
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(start = 8.dp)
+            )
+        }
+
+        if (split.totalActiveConnections > 0) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "本地物理直连",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextSecondary
+                    text = "活跃：中继 ${split.activeRelayConnections} · 组网 ${split.activeMeshConnections} · 直连 ${split.activeDirectConnections}",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                    color = TextMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
-                MetricValueText(
-                    formatted = if (split.directDownBps > 0L) {
-                        TrafficFormat.formatBps(split.directDownBps)
-                    } else {
-                        TrafficFormat.formatBytes(split.directTotalBytes)
-                    },
-                    prefix = if (split.directDownBps > 0L) "↓ " else "",
-                    numberSize = 19.sp,
-                    unitSize = 11.sp,
-                    prefixColor = AmberWarn
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "重置活跃连接",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = CoralAlert,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(CoralAlert.copy(alpha = 0.12f))
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = onCloseAllActive
+                        )
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
                 )
             }
         }
@@ -514,41 +592,87 @@ private fun CompactSplitHeaderCard(
                 HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.6f))
                 DualTrafficSparkline(
                     relaySamples = split.relayBpsHistory,
+                    meshSamples = split.meshBpsHistory,
                     directSamples = split.directBpsHistory,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(64.dp)
+                        .height(66.dp)
                 )
-                val totalActive = split.activeRelayConnections + split.activeDirectConnections
-                if (totalActive > 0) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "当前活跃 $totalActive 条连接",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextMuted
-                        )
-                        Text(
-                            text = "重置活跃连接",
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                            color = CoralAlert,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(CoralAlert.copy(alpha = 0.12f))
-                                .clickable(
-                                    interactionSource = remember { MutableInteractionSource() },
-                                    indication = null,
-                                    onClick = onCloseAllActive
-                                )
-                                .padding(horizontal = 8.dp, vertical = 3.dp)
-                        )
-                    }
-                }
             }
         }
+    }
+}
+
+@Composable
+private fun InspectorBucketColumn(
+    title: String,
+    accent: Color,
+    downBps: Long,
+    upBps: Long,
+    totalBytes: Long,
+    downBytes: Long,
+    upBytes: Long,
+    activeConns: Int,
+    totalConns: Int,
+    idleHint: String,
+    modifier: Modifier = Modifier
+) {
+    val hasLive = downBps > 0L || upBps > 0L
+    val primaryText = when {
+        downBps > 0L -> TrafficFormat.formatBps(downBps)
+        upBps > 0L -> TrafficFormat.formatBps(upBps)
+        else -> TrafficFormat.formatBytes(totalBytes)
+    }
+    val prefix = when {
+        downBps > 0L -> "↓"
+        upBps > 0L -> "↑"
+        else -> ""
+    }
+    val subLine = when {
+        hasLive -> "累计 ${TrafficFormat.formatBytes(totalBytes)}"
+        totalBytes > 0L -> "↓${TrafficFormat.formatBytes(downBytes)} ↑${TrafficFormat.formatBytes(upBytes)}"
+        activeConns > 0 -> "$activeConns 活跃连接"
+        totalConns > 0 -> "$totalConns 条连接"
+        else -> idleHint
+    }
+
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(5.5.dp)
+                    .clip(CircleShape)
+                    .background(accent)
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                color = TextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        MetricValueText(
+            formatted = primaryText,
+            prefix = prefix,
+            numberSize = 16.sp,
+            unitSize = 10.sp,
+            prefixColor = accent
+        )
+        Text(
+            text = subLine,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = 10.sp,
+                fontFeatureSettings = "tnum"
+            ),
+            color = TextMuted,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -567,12 +691,15 @@ private fun DomainTrafficRowCard(
     val barFraction = (item.totalBytes.toFloat() / maxBytes.toFloat()).coerceIn(0.03f, 1f)
     val monogram = remember(item.host) { domainMonogram(item.host) }
 
-    val conciseSubtitle = remember(item.routeNodeLabel, item.matchedRule) {
+    val conciseSubtitle = remember(item.routeNodeLabel, item.matchedRule, item.transportPath) {
         val rtt = DIRECT_RTT_REGEX.find(item.matchedRule)?.groupValues?.getOrNull(1)?.replace(" ", " ")
+        val pathSuffix = if (item.transportPath != TransportPathType.OFFLINE) {
+            " · ${item.transportPath.shortLabel}"
+        } else ""
         if (rtt != null) {
             "${item.routeNodeLabel} · $rtt"
         } else {
-            item.routeNodeLabel
+            "${item.routeNodeLabel}$pathSuffix"
         }
     }
 
@@ -725,11 +852,13 @@ private fun ConnectionRecordCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+                val pathPart = if (conn.transportPath != TransportPathType.OFFLINE) " · ${conn.transportPath.shortLabel}" else ""
                 Text(
-                    text = "${conn.routeNodeLabel} · ${conn.network}/${conn.protocol.ifBlank { "TCP" }}",
+                    text = "${conn.routeNodeLabel}$pathPart · ${conn.network}/${conn.protocol.ifBlank { "TCP" }}",
                     style = MaterialTheme.typography.labelSmall,
                     color = TextSecondary,
-                    maxLines = 1
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
             Spacer(modifier = Modifier.width(8.dp))
@@ -785,9 +914,12 @@ private fun DomainDetailBottomSheet(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    MicroPillBadge(text = domain.routeNodeLabel, color = accent, filled = true)
-                    domain.protocols.take(3).forEach { p ->
-                        MicroPillBadge(text = p, color = CyanBright)
+                    MicroPillBadge(text = domain.primaryCategory.badge, color = accent, filled = true)
+                    if (domain.transportPath != TransportPathType.OFFLINE) {
+                        MicroPillBadge(text = domain.transportPath.label, color = CyanBright)
+                    }
+                    domain.protocols.take(2).forEach { p ->
+                        MicroPillBadge(text = p, color = TextSecondary)
                     }
                 }
             }
@@ -802,8 +934,8 @@ private fun DomainDetailBottomSheet(
             }
         }
 
-        // 2. Primary Action Up Front: 1-Tap Routing Override
-        if (!domain.isPureIp && !domain.host.contains(' ')) {
+        // 2. Primary Action Up Front: 1-Tap Routing Override (public domains only; Tailnet Mesh stays internal)
+        if (!domain.isPureIp && !domain.host.contains(' ') && domain.primaryCategory != TrafficRouteCategory.TAILNET_MESH) {
             val ruleHost = domain.host.lowercase().removePrefix("www.")
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -856,6 +988,7 @@ private fun DomainDetailBottomSheet(
             contentPadding = PaddingValues(14.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            DetailKvRow("分流去向", "${domain.primaryCategory.label} · ${domain.routeNodeLabel}")
             DetailKvRow("累计流量 (会话占比 $pct)", "${TrafficFormat.formatBytes(domain.totalBytes)}  (↓ ${TrafficFormat.formatBytes(domain.downlinkTotal)} / ↑ ${TrafficFormat.formatBytes(domain.uplinkTotal)})")
             DetailKvRow("分流依据", domain.matchedRule)
         }
@@ -969,8 +1102,11 @@ private fun ConnectionDetailBottomSheet(
             color = TextPrimary
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            MicroPillBadge(text = conn.routeNodeLabel, color = accent, filled = true)
-            MicroPillBadge(text = "${conn.network} ${conn.protocol}".trim(), color = CyanBright)
+            MicroPillBadge(text = conn.primaryCategoryBadgeOrNode(), color = accent, filled = true)
+            if (conn.transportPath != TransportPathType.OFFLINE) {
+                MicroPillBadge(text = conn.transportPath.label, color = CyanBright)
+            }
+            MicroPillBadge(text = "${conn.network} ${conn.protocol}".trim(), color = TextSecondary)
         }
 
         GlassCard(
@@ -978,10 +1114,11 @@ private fun ConnectionDetailBottomSheet(
             contentPadding = PaddingValues(14.dp),
             verticalArrangement = Arrangement.spacedBy(7.dp)
         ) {
+            DetailKvRow("分流去向", "${conn.routeCategory.label} · ${conn.routeNodeLabel}")
             DetailKvRow("连接目标", "${conn.source} → ${conn.destination}")
             DetailKvRow("转发链路", conn.chainSummary)
             DetailKvRow("命中规则", conn.matchedRule)
-            DetailKvRow("累计流量", "${TrafficFormat.formatBytes(conn.totalBytes)} · 建立于 ${fmt.format(Date(conn.createdAtMs))}")
+            DetailKvRow("累计流量", "${TrafficFormat.formatBytes(conn.totalBytes)} (↓ ${TrafficFormat.formatBytes(conn.downlinkTotal)} / ↑ ${TrafficFormat.formatBytes(conn.uplinkTotal)}) · 建立于 ${fmt.format(Date(conn.createdAtMs))}")
         }
 
         if (conn.isActive) {
@@ -1046,6 +1183,8 @@ private fun EmptyTrafficCard(hasAnyTraffic: Boolean, isRunning: Boolean) {
         }
     }
 }
+
+private fun TrackedConnectionItem.primaryCategoryBadgeOrNode(): String = routeCategory.badge
 
 internal fun TrafficRouteCategory.routeAccentColor(): Color = when (this) {
     TrafficRouteCategory.RELAY_EXIT -> EmeraldGood

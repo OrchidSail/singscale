@@ -35,8 +35,9 @@ func connectionsSnapshot(trafficManager *trafficcontrol.Manager) render.M {
 		return metadata.OutboundType != C.TypeDNS
 	})
 	return render.M{
-		"downloadTotal": downlinkTotal,
-		"uploadTotal":   uplinkTotal,
+		"downloadTotal":  downlinkTotal,
+		"uploadTotal":    uplinkTotal,
+		"singscaleSplit": trafficManager.SingScaleTrafficSplit(),
 		"connections": common.Map(connections, func(metadata *trafficcontrol.TrackerMetadata) connectionObject {
 			return connectionObject(*metadata)
 		}),

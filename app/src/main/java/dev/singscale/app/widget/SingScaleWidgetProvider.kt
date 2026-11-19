@@ -117,7 +117,7 @@ class SingScaleWidgetProvider : AppWidgetProvider() {
             val subtitle = when {
                 state.tunnelStatus == TunnelStatus.RUNNING && state.activeQuality.reachable && state.activeQuality.latencyMs > 0 -> {
                     val rtt = state.activeQuality.latencyMs.roundToInt()
-                    "${state.activeQuality.pathType.badge} · ${rtt} ms"
+                    "${state.activeQuality.pathType.label} · ${rtt} ms"
                 }
                 state.tunnelStatus == TunnelStatus.RUNNING -> {
                     "${state.onlinePeersCount} 台在线"

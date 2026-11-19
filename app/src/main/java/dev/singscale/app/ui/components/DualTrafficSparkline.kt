@@ -35,42 +35,90 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import dev.singscale.app.core.TrafficFormat
+import dev.singscale.app.core.TrafficSplitTracker
 import dev.singscale.app.ui.theme.AmberWarn
 import dev.singscale.app.ui.theme.CyanBright
 import dev.singscale.app.ui.theme.EmeraldGood
 import dev.singscale.app.ui.theme.EmeraldSoft
+import dev.singscale.app.ui.theme.IndigoAccent
 import dev.singscale.app.ui.theme.ObsidianBorder
 import dev.singscale.app.ui.theme.ObsidianCard
 import dev.singscale.app.ui.theme.ObsidianElevated
 import dev.singscale.app.ui.theme.TextSecondary
-import java.util.Locale
 import kotlin.math.max
 
+/**
+ * Three-way mutually-exclusive split ratio bar:
+ * - 中继 / 出口 (Emerald)
+ * - 组网直连 (Indigo)
+ * - 本地直连 (Amber)
+ * Displayed percentages use largest-remainder tenths so non-zero totals always conserve 100.0%.
+ */
 @Composable
 fun SplitRatioProgressBar(
     relayBytes: Long,
+    meshBytes: Long,
     directBytes: Long,
     relayBps: Long,
+    meshBps: Long,
     directBps: Long,
     modifier: Modifier = Modifier
 ) {
-    val totalBytes = relayBytes + directBytes
-    val totalBps = relayBps + directBps
+    val safeRelayBytes = relayBytes.coerceAtLeast(0L)
+    val safeMeshBytes = meshBytes.coerceAtLeast(0L)
+    val safeDirectBytes = directBytes.coerceAtLeast(0L)
+    val totalBytes = safeRelayBytes + safeMeshBytes + safeDirectBytes
+
+    val safeRelayBps = relayBps.coerceAtLeast(0L)
+    val safeMeshBps = meshBps.coerceAtLeast(0L)
+    val safeDirectBps = directBps.coerceAtLeast(0L)
+    val totalBps = safeRelayBps + safeMeshBps + safeDirectBps
+
+    val hasAnyTraffic = totalBytes > 0L || totalBps > 0L
+
     val rawRelayRatio = when {
-        totalBytes > 0L -> (relayBytes.toDouble() / totalBytes.toDouble()).toFloat().coerceIn(0f, 1f)
-        totalBps > 0L -> (relayBps.toDouble() / totalBps.toDouble()).toFloat().coerceIn(0f, 1f)
-        else -> 0.5f
+        totalBytes > 0L -> (safeRelayBytes.toDouble() / totalBytes.toDouble()).toFloat().coerceIn(0f, 1f)
+        totalBps > 0L -> (safeRelayBps.toDouble() / totalBps.toDouble()).toFloat().coerceIn(0f, 1f)
+        else -> 0f
     }
-    val animatedRelayFraction by animateFloatAsState(
+    val rawMeshRatio = when {
+        totalBytes > 0L -> (safeMeshBytes.toDouble() / totalBytes.toDouble()).toFloat().coerceIn(0f, 1f)
+        totalBps > 0L -> (safeMeshBps.toDouble() / totalBps.toDouble()).toFloat().coerceIn(0f, 1f)
+        else -> 0f
+    }
+    val rawDirectRatio = when {
+        totalBytes > 0L -> (safeDirectBytes.toDouble() / totalBytes.toDouble()).toFloat().coerceIn(0f, 1f)
+        totalBps > 0L -> (safeDirectBps.toDouble() / totalBps.toDouble()).toFloat().coerceIn(0f, 1f)
+        else -> 0f
+    }
+
+    val animRelay by animateFloatAsState(
         targetValue = rawRelayRatio,
-        animationSpec = tween(durationMillis = 480, easing = FastOutSlowInEasing),
-        label = "relayFraction"
+        animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing),
+        label = "relayRatio"
+    )
+    val animMesh by animateFloatAsState(
+        targetValue = rawMeshRatio,
+        animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing),
+        label = "meshRatio"
+    )
+    val animDirect by animateFloatAsState(
+        targetValue = rawDirectRatio,
+        animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing),
+        label = "directRatio"
     )
 
-    val relayPct = if (totalBytes > 0L) (relayBytes.toDouble() * 100.0 / totalBytes.toDouble()) else 0.0
-    val directPct = if (totalBytes > 0L) (100.0 - relayPct).coerceAtLeast(0.0) else 0.0
+    val (relayPctStr, meshPctStr, directPctStr) = if (totalBytes > 0L) {
+        TrafficSplitTracker.computeDisplayPercents(safeRelayBytes, safeMeshBytes, safeDirectBytes)
+    } else if (totalBps > 0L) {
+        TrafficSplitTracker.computeDisplayPercents(safeRelayBps, safeMeshBps, safeDirectBps)
+    } else {
+        Triple("0.0%", "0.0%", "0.0%")
+    }
 
     Column(modifier = modifier.fillMaxWidth()) {
         Row(
@@ -78,35 +126,24 @@ fun SplitRatioProgressBar(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .clip(CircleShape)
-                        .background(EmeraldGood)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = String.format(Locale.US, "中继/出口 %.1f%%", relayPct),
-                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                    color = EmeraldSoft
-                )
-            }
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = String.format(Locale.US, "本地直连 %.1f%%", directPct),
-                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                    color = AmberWarn
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .clip(CircleShape)
-                        .background(AmberWarn)
-                )
-            }
+            RatioLegendItem(
+                label = "中继",
+                percentText = relayPctStr,
+                dotColor = EmeraldGood,
+                textColor = EmeraldSoft
+            )
+            RatioLegendItem(
+                label = "组网直连",
+                percentText = meshPctStr,
+                dotColor = IndigoAccent,
+                textColor = IndigoAccent
+            )
+            RatioLegendItem(
+                label = "本地直连",
+                percentText = directPctStr,
+                dotColor = AmberWarn,
+                textColor = AmberWarn
+            )
         }
 
         Spacer(modifier = Modifier.height(7.dp))
@@ -118,61 +155,61 @@ fun SplitRatioProgressBar(
                 .clip(RoundedCornerShape(999.dp))
                 .background(ObsidianElevated)
         ) {
-            when {
-                totalBytes == 0L && totalBps == 0L -> {
+            if (!hasAnyTraffic) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(ObsidianBorder.copy(alpha = 0.65f))
+                )
+            } else {
+                val activeSegments = buildList {
+                    if (rawRelayRatio > 0f || animRelay > 0.004f) {
+                        add(
+                            Triple(
+                                animRelay.coerceAtLeast(if (rawRelayRatio > 0f) 0.04f else 0.004f),
+                                listOf(CyanBright, EmeraldGood),
+                                "relay"
+                            )
+                        )
+                    }
+                    if (rawMeshRatio > 0f || animMesh > 0.004f) {
+                        add(
+                            Triple(
+                                animMesh.coerceAtLeast(if (rawMeshRatio > 0f) 0.04f else 0.004f),
+                                listOf(IndigoAccent.copy(alpha = 0.80f), IndigoAccent),
+                                "mesh"
+                            )
+                        )
+                    }
+                    if (rawDirectRatio > 0f || animDirect > 0.004f) {
+                        add(
+                            Triple(
+                                animDirect.coerceAtLeast(if (rawDirectRatio > 0f) 0.04f else 0.004f),
+                                listOf(AmberWarn.copy(alpha = 0.80f), AmberWarn),
+                                "direct"
+                            )
+                        )
+                    }
+                }
+
+                if (activeSegments.isEmpty()) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .background(ObsidianBorder.copy(alpha = 0.65f))
                     )
-                }
-                animatedRelayFraction <= 0.005f -> {
-                    // Pure 100% Direct — clean unbroken luminous gold-amber bar
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(
-                                Brush.horizontalGradient(
-                                    colors = listOf(AmberWarn.copy(alpha = 0.78f), AmberWarn)
-                                )
-                            )
-                    )
-                }
-                animatedRelayFraction >= 0.995f -> {
-                    // Pure 100% Relay/Exit — clean unbroken luminous cyan-emerald bar
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(
-                                Brush.horizontalGradient(
-                                    colors = listOf(CyanBright, EmeraldGood)
-                                )
-                            )
-                    )
-                }
-                else -> {
-                    val leftWeight = animatedRelayFraction.coerceIn(0.03f, 0.97f)
-                    Box(
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .weight(leftWeight)
-                            .background(
-                                Brush.horizontalGradient(
-                                    colors = listOf(CyanBright, EmeraldGood)
-                                )
-                            )
-                    )
-                    Spacer(modifier = Modifier.width(2.5.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .weight((1f - leftWeight).coerceAtLeast(0.03f))
-                            .background(
-                                Brush.horizontalGradient(
-                                    colors = listOf(AmberWarn.copy(alpha = 0.80f), AmberWarn)
-                                )
-                            )
-                    )
+                } else {
+                    activeSegments.forEachIndexed { idx, (weight, colors, _) ->
+                        if (idx > 0) {
+                            Spacer(modifier = Modifier.width(2.dp))
+                        }
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .weight(weight.coerceAtLeast(0.01f))
+                                .background(Brush.horizontalGradient(colors = colors))
+                        )
+                    }
                 }
             }
         }
@@ -180,15 +217,51 @@ fun SplitRatioProgressBar(
 }
 
 @Composable
+private fun RatioLegendItem(
+    label: String,
+    percentText: String,
+    dotColor: Color,
+    textColor: Color
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier
+                .size(6.5.dp)
+                .clip(CircleShape)
+                .background(dotColor)
+        )
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(
+            text = "$label $percentText",
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                fontFeatureSettings = "tnum"
+            ),
+            color = textColor,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/**
+ * Real-time 30-point throughput waveform plotting all 3 independent traffic buckets:
+ * 中继 / 出口 (Emerald), 组网直连 (Indigo), and 本地直连 (Amber).
+ */
+@Composable
 fun DualTrafficSparkline(
     relaySamples: List<Float>,
     directSamples: List<Float>,
     modifier: Modifier = Modifier,
+    meshSamples: List<Float> = emptyList(),
     relayColor: Color = EmeraldGood,
+    meshColor: Color = IndigoAccent,
     directColor: Color = AmberWarn
 ) {
     val peakBps = max(
-        relaySamples.maxOrNull() ?: 0f,
+        max(relaySamples.maxOrNull() ?: 0f, meshSamples.maxOrNull() ?: 0f),
         directSamples.maxOrNull() ?: 0f
     )
     val safeCeil = max(peakBps * 1.18f, 4096f)
@@ -246,27 +319,46 @@ fun DualTrafficSparkline(
 
                 drawPath(
                     path = linePath,
-                    color = strokeColor.copy(alpha = if (hasSignal) 0.95f else 0.35f),
-                    style = Stroke(width = if (hasSignal) 2.2.dp.toPx() else 1.4.dp.toPx(), cap = StrokeCap.Round)
+                    color = strokeColor.copy(alpha = if (hasSignal) 0.95f else 0.30f),
+                    style = Stroke(width = if (hasSignal) 2.1.dp.toPx() else 1.2.dp.toPx(), cap = StrokeCap.Round)
                 )
 
                 if (hasSignal) {
                     val tip = points.last()
                     drawCircle(
                         color = strokeColor.copy(alpha = 0.28f),
-                        radius = 6.dp.toPx(),
+                        radius = 5.5.dp.toPx(),
                         center = tip
                     )
                     drawCircle(
                         color = strokeColor,
-                        radius = 2.8.dp.toPx(),
+                        radius = 2.6.dp.toPx(),
                         center = tip
                     )
                 }
             }
 
-            drawSeries(directSamples, directColor, topFillAlpha = 0.22f)
-            drawSeries(relaySamples, relayColor, topFillAlpha = 0.28f)
+            drawSeries(directSamples, directColor, topFillAlpha = 0.20f)
+            if (meshSamples.size >= 2) {
+                drawSeries(meshSamples, meshColor, topFillAlpha = 0.24f)
+            }
+            drawSeries(relaySamples, relayColor, topFillAlpha = 0.26f)
+        }
+
+        // Compact 3-way legend pill top-left
+        Row(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .clip(RoundedCornerShape(6.dp))
+                .background(ObsidianCard.copy(alpha = 0.84f))
+                .border(0.75.dp, ObsidianBorder, RoundedCornerShape(6.dp))
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SparkLegendDot("中继", relayColor)
+            SparkLegendDot("组网", meshColor)
+            SparkLegendDot("直连", directColor)
         }
 
         if (peakBps > 0f) {
@@ -280,10 +372,32 @@ fun DualTrafficSparkline(
             ) {
                 Text(
                     text = "30s 峰值 ${TrafficFormat.formatBps(peakBps.toLong())}",
-                    style = MaterialTheme.typography.labelSmall,
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontSize = 10.sp,
+                        fontFeatureSettings = "tnum"
+                    ),
                     color = TextSecondary
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun SparkLegendDot(label: String, color: Color) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier
+                .size(5.dp)
+                .clip(CircleShape)
+                .background(color)
+        )
+        Spacer(modifier = Modifier.width(3.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.5.sp),
+            color = TextSecondary,
+            maxLines = 1
+        )
     }
 }

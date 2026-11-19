@@ -20,6 +20,8 @@ import dev.singscale.app.VpnToggleTrampolineActivity
 import dev.singscale.app.core.AppPowerStateMonitor
 import dev.singscale.app.core.ConfigBuilder
 import dev.singscale.app.core.GatewayProbeStatus
+import dev.singscale.app.core.KernelBucketTotals
+import dev.singscale.app.core.KernelTrafficSplit
 import dev.singscale.app.core.LinkQualityMetrics
 import dev.singscale.app.core.QualityEngine
 import dev.singscale.app.core.RuntimePowerMode
@@ -266,6 +268,7 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
         val curAddr: String = "",
         val peerRelay: String = "",
         val derpRegion: String = "",
+        val pathType: String = "",
         val addrs: List<String> = emptyList(),
         val primaryRoutes: List<String> = emptyList(),
         val allowedIPs: List<String> = emptyList(),
@@ -332,6 +335,35 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
         val bestLatencyMs: Double = 0.0,
         val reachablePorts: List<GoGatewayPortDto> = emptyList()
     )
+
+    @Serializable
+    private data class GoTrafficBucketDto(
+        val uplinkBytes: Long = 0L,
+        val downlinkBytes: Long = 0L,
+        val totalBytes: Long = 0L,
+        val activeConnections: Int = 0,
+        val totalConnections: Long = 0L
+    ) {
+        fun toDomain(): KernelBucketTotals = KernelBucketTotals(
+            uplinkBytes = uplinkBytes.coerceAtLeast(0L),
+            downlinkBytes = downlinkBytes.coerceAtLeast(0L),
+            activeConnections = activeConnections.coerceAtLeast(0),
+            totalConnections = totalConnections.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+        )
+    }
+
+    @Serializable
+    private data class GoTrafficSplitDto(
+        val direct: GoTrafficBucketDto = GoTrafficBucketDto(),
+        val mesh: GoTrafficBucketDto = GoTrafficBucketDto(),
+        val relay: GoTrafficBucketDto = GoTrafficBucketDto()
+    ) {
+        fun toDomain(): KernelTrafficSplit = KernelTrafficSplit(
+            direct = direct.toDomain(),
+            mesh = mesh.toDomain(),
+            relay = relay.toDomain()
+        )
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -820,6 +852,19 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
         }
     }
 
+    private fun syncKernelTrafficSplit(expectedEpoch: Int = currentInstanceEpoch) {
+        val srv = commandServer ?: return
+        if (isShuttingDown || expectedEpoch <= 0) return
+        val raw = runCatching { srv.singScaleGetTrafficSplitJSON() }.getOrNull().orEmpty()
+        if (raw.isBlank()) return
+        val dto = runCatching { jsonParser.decodeFromString<GoTrafficSplitDto>(raw) }.getOrNull() ?: return
+        TrafficSplitTracker.reconcileKernelTotals(
+            kernelSplit = dto.toDomain(),
+            uiState = SingScaleRepository.state.value,
+            instanceEpoch = expectedEpoch
+        )
+    }
+
     private fun startStatusStreamClient() {
         if (!AppPowerStateMonitor.state.value.shouldStreamLiveUiTelemetry || isShuttingDown) return
         streamReconnectJob?.cancel()
@@ -873,11 +918,17 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
                 override fun initializeClashMode(modeList: StringIterator?, currentMode: String?) {}
                 override fun updateClashMode(newMode: String?) {}
                 override fun writeConnectionEvents(events: ConnectionEvents?) {
+                    val epoch = currentInstanceEpoch
                     TrafficSplitTracker.onConnectionEvents(
                         events = events,
                         uiState = SingScaleRepository.state.value,
-                        instanceEpoch = currentInstanceEpoch
+                        instanceEpoch = epoch
                     )
+                    if (events?.reset == true) {
+                        serviceScope.launch {
+                            syncKernelTrafficSplit(epoch)
+                        }
+                    }
                 }
             },
             opts
@@ -1302,6 +1353,8 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
             SingScaleRepository.updateLastConfigJson(plan.configJson)
 
             if (forceReloadIfConfigDiffers && plan.reloadFingerprint != lastAppliedReloadFingerprint) {
+                // Capture exact kernel-level 3-way split totals before hot-reloading replaces trafficManager
+                syncKernelTrafficSplit(currentInstanceEpoch)
                 val overrideOpts = OverrideOptions().apply {
                     autoRedirect = false
                     excludePackage = StringListIterator(listOf(packageName))

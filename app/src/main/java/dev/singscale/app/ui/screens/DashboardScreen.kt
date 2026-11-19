@@ -315,6 +315,7 @@ private fun ExpandableGatewayCard(
 ) {
     val isRunning = state.tunnelStatus == TunnelStatus.RUNNING
     val exitPeer = state.activeExitPeer
+    val relayPeer = state.activeRelayPeer
     val q = state.activeQuality
     val accent = if (isRunning) q.pathType.accentColor() else TextMuted
 
@@ -325,21 +326,27 @@ private fun ExpandableGatewayCard(
     )
 
     val gatewayTitle = when {
+        exitPeer != null && relayPeer != null && relayPeer.stableId != exitPeer.stableId ->
+            "${relayPeer.displayName} → ${exitPeer.displayName}"
         exitPeer != null -> exitPeer.displayName
+        relayPeer != null -> relayPeer.displayName
         state.policyMode == RoutingPolicyMode.MESH_ONLY -> "仅组网内网互通"
         !isRunning -> "启动后自动优选出口"
         else -> "公网本地直连"
     }
     val roleLabel = when {
+        exitPeer != null && relayPeer != null && relayPeer.stableId != exitPeer.stableId -> "中继 → 出口"
         exitPeer != null && state.isAutoExitActive -> "自动出口"
         exitPeer != null -> "锁定出口"
+        relayPeer != null -> "当前中继"
         else -> "当前网关"
     }
     val rttBadge = when {
         !isRunning -> "待机"
-        q.reachable && q.latencyMs > 0 -> "${q.latencyMs.roundToInt()} ms · ${q.pathType.badge}"
-        exitPeer != null -> exitPeer.effectivePathType.badge
-        else -> "DIRECT"
+        q.reachable && q.latencyMs > 0 -> "${q.latencyMs.roundToInt()} ms · ${q.pathType.shortLabel}"
+        exitPeer != null -> exitPeer.effectivePathType.shortLabel
+        relayPeer != null -> relayPeer.effectivePathType.shortLabel
+        else -> "直连"
     }
 
     GlassCard(
@@ -636,15 +643,17 @@ private fun CompactTrafficSplitCard(
             }
         }
 
-        // Visual Ratio Bar
+        // 3-Way Visual Ratio Bar (中继 / 组网直连 / 本地直连)
         SplitRatioProgressBar(
             relayBytes = split.relayTotalBytes,
+            meshBytes = split.meshTotalBytes,
             directBytes = split.directTotalBytes,
             relayBps = split.relayTotalBps,
+            meshBps = split.meshTotalBps,
             directBps = split.directTotalBps
         )
 
-        // Clean 2-Column Essential Numbers (No Visual Clutter!)
+        // Clean 3-Column Essential Numbers (中继/出口 · 组网直连 · 本地直连)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -652,20 +661,57 @@ private fun CompactTrafficSplitCard(
             verticalAlignment = Alignment.CenterVertically
         ) {
             EssentialSplitMetric(
-                label = "中继 / 出口",
-                primaryFormatted = if (split.relayDownBps > 0L) {
-                    TrafficFormat.formatBps(split.relayDownBps)
-                } else {
-                    TrafficFormat.formatBytes(split.relayTotalBytes)
+                label = "中继/出口",
+                primaryFormatted = when {
+                    split.relayDownBps > 0L -> TrafficFormat.formatBps(split.relayDownBps)
+                    split.relayUpBps > 0L -> TrafficFormat.formatBps(split.relayUpBps)
+                    else -> TrafficFormat.formatBytes(split.relayTotalBytes)
                 },
-                prefix = if (split.relayDownBps > 0L) "↓ " else "",
-                secondary = if (split.relayDownBps > 0L) {
-                    "累计 ${TrafficFormat.formatBytes(split.relayTotalBytes)}"
-                } else {
-                    state.activeExitPeer?.displayName ?: "按需介入"
+                prefix = when {
+                    split.relayDownBps > 0L -> "↓"
+                    split.relayUpBps > 0L -> "↑"
+                    else -> ""
+                },
+                secondary = when {
+                    split.relayTotalBps > 0L -> "累计 ${TrafficFormat.formatBytes(split.relayTotalBytes)}"
+                    split.activeRelayConnections > 0 -> "${split.activeRelayConnections} 活跃连接"
+                    else -> state.activeExitPeer?.displayName ?: "按需介入"
                 },
                 accent = EmeraldGood,
-                modifier = Modifier.weight(1f)
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp)
+            )
+
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .fillMaxHeight()
+                    .padding(vertical = 2.dp)
+                    .background(ObsidianBorder)
+            )
+
+            EssentialSplitMetric(
+                label = "组网直连",
+                primaryFormatted = when {
+                    split.meshDownBps > 0L -> TrafficFormat.formatBps(split.meshDownBps)
+                    split.meshUpBps > 0L -> TrafficFormat.formatBps(split.meshUpBps)
+                    else -> TrafficFormat.formatBytes(split.meshTotalBytes)
+                },
+                prefix = when {
+                    split.meshDownBps > 0L -> "↓"
+                    split.meshUpBps > 0L -> "↑"
+                    else -> ""
+                },
+                secondary = when {
+                    split.meshTotalBps > 0L -> "累计 ${TrafficFormat.formatBytes(split.meshTotalBytes)}"
+                    split.activeMeshConnections > 0 -> "${split.activeMeshConnections} 活跃连接"
+                    else -> "100.x 内网"
+                },
+                accent = IndigoAccent,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 8.dp)
             )
 
             Box(
@@ -678,25 +724,29 @@ private fun CompactTrafficSplitCard(
 
             EssentialSplitMetric(
                 label = "本地直连",
-                primaryFormatted = if (split.directDownBps > 0L) {
-                    TrafficFormat.formatBps(split.directDownBps)
-                } else {
-                    TrafficFormat.formatBytes(split.directTotalBytes)
+                primaryFormatted = when {
+                    split.directDownBps > 0L -> TrafficFormat.formatBps(split.directDownBps)
+                    split.directUpBps > 0L -> TrafficFormat.formatBps(split.directUpBps)
+                    else -> TrafficFormat.formatBytes(split.directTotalBytes)
                 },
-                prefix = if (split.directDownBps > 0L) "↓ " else "",
-                secondary = if (split.directDownBps > 0L) {
-                    "累计 ${TrafficFormat.formatBytes(split.directTotalBytes)}"
-                } else {
-                    "直连质量优先"
+                prefix = when {
+                    split.directDownBps > 0L -> "↓"
+                    split.directUpBps > 0L -> "↑"
+                    else -> ""
+                },
+                secondary = when {
+                    split.directTotalBps > 0L -> "累计 ${TrafficFormat.formatBytes(split.directTotalBytes)}"
+                    split.activeDirectConnections > 0 -> "${split.activeDirectConnections} 活跃连接"
+                    else -> "直连优先"
                 },
                 accent = AmberWarn,
                 modifier = Modifier
                     .weight(1f)
-                    .padding(start = 16.dp)
+                    .padding(start = 8.dp)
             )
         }
 
-        // Optional Expandable 30s Sparkline + Top 2 Domains
+        // Optional Expandable 30s 3-Way Sparkline + Active Breakdown + Top Domains
         AnimatedVisibility(
             visible = chartExpanded,
             enter = expandVertically(animationSpec = spring(stiffness = Spring.StiffnessMediumLow)) +
@@ -708,14 +758,24 @@ private fun CompactTrafficSplitCard(
                 HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.6f))
                 DualTrafficSparkline(
                     relaySamples = split.relayBpsHistory,
+                    meshSamples = split.meshBpsHistory,
                     directSamples = split.directBpsHistory,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(58.dp)
+                        .height(62.dp)
                 )
+                if (split.totalActiveConnections > 0) {
+                    Text(
+                        text = "活跃连接：中继 ${split.activeRelayConnections} · 组网直连 ${split.activeMeshConnections} · 本地直连 ${split.activeDirectConnections}",
+                        style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                        color = TextMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 if (split.domains.isNotEmpty()) {
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        split.domains.take(2).forEach { dom ->
+                        split.domains.take(3).forEach { dom ->
                             DashboardDomainPreviewRow(domain = dom)
                         }
                     }
@@ -738,21 +798,35 @@ private fun EssentialSplitMetric(
         modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(2.dp)
     ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = TextSecondary
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(5.5.dp)
+                    .clip(CircleShape)
+                    .background(accent)
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                color = TextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
         MetricValueText(
             formatted = primaryFormatted,
             prefix = prefix,
-            numberSize = 20.sp,
-            unitSize = 11.5.sp,
+            numberSize = 16.5.sp,
+            unitSize = 10.sp,
             prefixColor = accent
         )
         Text(
             text = secondary,
-            style = MaterialTheme.typography.labelSmall,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = 10.5.sp,
+                fontFeatureSettings = "tnum"
+            ),
             color = TextMuted,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
