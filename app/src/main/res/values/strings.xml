@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SingScale</string>
+    <string name="widget_mini_title">SingScale 快捷开关 (1×1)</string>
+    <string name="widget_mini_description">1×1 极简图标级开关：轻触一键开启或关闭 SingScale 组网，实时显示连接状态与毫秒级延迟。</string>
+    <string name="widget_title">SingScale 状态卡片 (4×2)</string>
+    <string name="widget_description">一键开启或关闭 SingScale 组网隧道，展示完整出口节点与链路质量并支持切换动态策略。</string>
+</resources>

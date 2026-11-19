@@ -1,0 +1,4 @@
+-keep class go.** { *; }
+-keep class io.nekohasekai.libbox.** { *; }
+-dontwarn go.**
+-dontwarn io.nekohasekai.libbox.**

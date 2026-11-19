@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer subtle cyan ring -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M54,24A30,30 0,1 1,53.99 24Z"
+        android:strokeWidth="2.5"
+        android:strokeColor="#5522D3EE" />
+    <!-- Dynamic mesh links -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M38,40L54,54L70,40M38,68L54,54L70,68M54,34L54,74"
+        android:strokeWidth="3.8"
+        android:strokeColor="#FF22D3EE"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <!-- Mesh peer nodes -->
+    <path
+        android:fillColor="#FF67E8F9"
+        android:pathData="M38,35a5,5 0,1 0,0 10a5,5 0,1 0,0 -10zM70,35a5,5 0,1 0,0 10a5,5 0,1 0,0 -10zM38,63a5,5 0,1 0,0 10a5,5 0,1 0,0 -10zM70,63a5,5 0,1 0,0 10a5,5 0,1 0,0 -10z" />
+    <!-- Central Emerald Exit/Relay core -->
+    <path
+        android:fillColor="#FF10B981"
+        android:pathData="M54,46.5a7.5,7.5 0,1 0,0 15a7.5,7.5 0,1 0,0 -15z" />
+</vector>

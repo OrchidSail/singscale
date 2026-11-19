@@ -1,0 +1,58 @@
+# Gradle & Android build outputs
+.gradle/
+.kotlin/
+/build/
+/app/build/
+app/.cxx/
+.cxx/
+.externalNativeBuild/
+captures/
+*.hprof
+*.ap_
+*.dex
+
+# Compiled deliverables & generated native core artifacts
+*.apk
+*.aab
+*.aar
+app/libs/*.aar
+app/libs/*.jar
+
+# Local environment & signing secrets (NEVER commit)
+local.properties
+keystore.properties
+signing.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.key
+.env
+.env.*
+google-services.json
+
+# Go build & test artifacts
+*.exe
+*.test
+*.out
+coverage.out
+core/sing-box/sing-box
+
+# IDE & editor files
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.navigation/
+
+# OS & temporary / debug files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp
+tombstone*
+dumpsys*
+logcat*
+qa-*/

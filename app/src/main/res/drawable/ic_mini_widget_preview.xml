@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Squircle Base -->
+    <path android:pathData="M28,6L68,6A22,22 0,0 1,90 28L90,68A22,22 0,0 1,68 90L28,90A22,22 0,0 1,6 68L6,28A22,22 0,0 1,28 6z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="90"
+                android:endY="90"
+                android:startX="6"
+                android:startY="6"
+                android:type="linear">
+                <item android:color="#FF12232B" android:offset="0.0" />
+                <item android:color="#FF070B14" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:endX="90"
+                android:endY="90"
+                android:startX="6"
+                android:startY="6"
+                android:type="linear">
+                <item android:color="#886EE7B7" android:offset="0.0" />
+                <item android:color="#3322D3EE" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Subtle Outer Bezel Ring -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M48,18a30,30 0,1 1,0 60a30,30 0,1 1,0 -60z"
+        android:strokeColor="#4434D399"
+        android:strokeWidth="1.5" />
+    <!-- Emerald Tactile Core -->
+    <path android:pathData="M48,27a21,21 0,1 1,0 42a21,21 0,1 1,0 -42z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="48"
+                android:endY="69"
+                android:startX="48"
+                android:startY="27"
+                android:type="linear">
+                <item android:color="#FF34D399" android:offset="0.0" />
+                <item android:color="#FF059669" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Power Glyph -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M53.3,43.2A7.5,7.5 0,1 1,42.7 43.2M48,39.5L48,47.5"
+        android:strokeColor="#FF022015"
+        android:strokeLineCap="round"
+        android:strokeWidth="2.2" />
+    <!-- Top-Right LED -->
+    <path
+        android:fillColor="#FF34D399"
+        android:pathData="M77,19m-2.2,0a2.2,2.2 0,1 1,4.4 0a2.2,2.2 0,1 1,-4.4 0" />
+</vector>
