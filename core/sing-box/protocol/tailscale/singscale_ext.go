@@ -769,3 +769,13 @@ func (t *Endpoint) SingScaleSetPowerMode(sleeping bool, networkUp bool) {
 	}
 	mc.SetNetworkUp(networkUp)
 }
+
+func (t *Endpoint) SingScaleSetInboundLocalForward(enabled bool) {
+	if t == nil {
+		return
+	}
+	t.allowLocalPortForward.Store(enabled)
+	if fwd := t.inboundForwarder.Load(); fwd != nil {
+		fwd.SetEnabled(enabled)
+	}
+}

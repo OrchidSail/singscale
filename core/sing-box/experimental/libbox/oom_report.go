@@ -63,6 +63,11 @@ func OOMRecorderOptions(startedService *daemon.StartedService) oomkiller.Recorde
 			return formatLogEntries(startedService.SavedLog())
 		},
 		SnapshotCallback: func(directory string, prefix string) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.StdLogger().Error("OOM report snapshot recovered panic: ", r)
+				}
+			}()
 			for _, name := range oomReportProfiles {
 				writeOOMProfile(filepath.Join(directory, prefix+"."+name+".pb"), name)
 			}
@@ -238,6 +243,11 @@ func writeWithoutColors(buffer *bytes.Buffer, message string) {
 }
 
 func writeOOMProfile(filePath string, name string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.StdLogger().Error("OOM report profile ", name, " recovered panic: ", r)
+		}
+	}()
 	err := oomprofile.WriteFile(filePath, name)
 	if err != nil {
 		return

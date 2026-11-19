@@ -12,11 +12,14 @@ import dev.singscale.app.core.QualityGrade
 import dev.singscale.app.core.RoutingPolicyMode
 import dev.singscale.app.core.RuntimePowerMode
 import dev.singscale.app.core.RuntimePowerState
+import dev.singscale.app.core.SingScaleRepository
 import dev.singscale.app.core.SingScaleUiState
 import dev.singscale.app.core.TailnetPeer
 import dev.singscale.app.core.TrafficRouteCategory
 import dev.singscale.app.core.TrafficSplitTracker
 import dev.singscale.app.core.TransportPathType
+import dev.singscale.app.core.TunAddressRebindGuard
+import dev.singscale.app.core.TunRebindDecision
 import dev.singscale.app.service.InterfaceSyncSignature
 import dev.singscale.app.service.LocalResolver
 import dev.singscale.app.service.formatValidatedCidrPrefix
@@ -757,5 +760,190 @@ class SingScaleEngineTest {
             assertTrue(widgetXml.readText().contains("android:updatePeriodMillis=\"0\""))
             assertTrue(miniWidgetXml.readText().contains("android:updatePeriodMillis=\"0\""))
         }
+    }
+
+    @Test
+    fun `config builder falls back to 172_19_0_1_30 before login and binds real tailscale 100_x_32 with magic dns once known`() {
+        // 1. Strict CGNAT 100.64.0.0/10 validator rejects non-Tailscale & reserved Quad100 addresses
+        assertNull(ConfigBuilder.normalizeTailscaleIpv4(null))
+        assertNull(ConfigBuilder.normalizeTailscaleIpv4(""))
+        assertNull(ConfigBuilder.normalizeTailscaleIpv4("172.19.0.1"))
+        assertNull(ConfigBuilder.normalizeTailscaleIpv4("198.51.100.50"))
+        assertNull(ConfigBuilder.normalizeTailscaleIpv4("100.63.255.255"))
+        assertNull(ConfigBuilder.normalizeTailscaleIpv4("100.128.0.1"))
+        assertNull(ConfigBuilder.normalizeTailscaleIpv4("100.100.100.100"))
+        assertNull(ConfigBuilder.normalizeTailscaleIpv4("100.64.0.0"))
+        assertNull(ConfigBuilder.normalizeTailscaleIpv4("100.127.255.255"))
+        assertEquals("100.64.0.100", ConfigBuilder.normalizeTailscaleIpv4("100.64.0.100/32"))
+        assertEquals("100.64.0.1", ConfigBuilder.normalizeTailscaleIpv4(" 100.64.0.1 "))
+        assertEquals("172.19.0.1/30", ConfigBuilder.resolveTunIpv4Cidr(""))
+        assertEquals("100.64.0.100/32", ConfigBuilder.resolveTunIpv4Cidr("100.64.0.100"))
+
+        // 2. Unauthenticated state safely falls back to 172.19.0.1/30 without overriding dns_address
+        val fallbackPlan = ConfigBuilder.build(SingScaleUiState(), "singscale-test", enableIpv6 = false)
+        assertEquals("172.19.0.1/30", fallbackPlan.tunIpv4Address)
+        assertFalse(fallbackPlan.usesTailscaleTunIp)
+        val fallbackTun = json.parseToJsonElement(fallbackPlan.configJson)
+            .jsonObject["inbounds"]!!.jsonArray[0].jsonObject
+        assertEquals(listOf("172.19.0.1/30"), fallbackTun["address"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertFalse(fallbackTun.containsKey("dns_address"))
+
+        // 3. Authenticated state with real Tailscale 100.x IPv4 binds 100.x/32 + MagicDNS 100.100.100.100
+        val selfPeer = TailnetPeer(
+            stableId = "self-phone",
+            hostName = "android-device",
+            tailscaleIPs = listOf("100.64.0.100", "fd7a:115c:a1e0::abc1")
+        )
+        val loggedInState = SingScaleUiState(
+            backendState = "Running",
+            hasSavedLogin = true,
+            selfPeer = selfPeer
+        )
+        val v4Plan = ConfigBuilder.build(loggedInState, "singscale-test", enableIpv6 = false)
+        assertEquals("100.64.0.100/32", v4Plan.tunIpv4Address)
+        assertTrue(v4Plan.usesTailscaleTunIp)
+        assertNotEquals(fallbackPlan.reloadFingerprint, v4Plan.reloadFingerprint)
+
+        val v4Root = json.parseToJsonElement(v4Plan.configJson).jsonObject
+        val v4Tun = v4Root["inbounds"]!!.jsonArray[0].jsonObject
+        assertEquals(listOf("100.64.0.100/32"), v4Tun["address"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(listOf("100.100.100.100"), v4Tun["dns_address"]!!.jsonArray.map { it.jsonPrimitive.content })
+
+        // Verify 100.64.0.0/10 is NOT excluded from tun0 and routes to ts-ep without conflict
+        val excluded = v4Tun["route_exclude_address"]!!.jsonArray.map { it.jsonPrimitive.content }
+        assertTrue(excluded.none { it.startsWith("100.") })
+        val routeRules = v4Root["route"]!!.jsonObject["rules"]!!.jsonArray.toString()
+        assertTrue(routeRules.contains("100.64.0.0/10"))
+        assertTrue(routeRules.contains("hijack-dns"))
+
+        // 4. Dual-stack binds both 100.x/32 + fd7a:.../128 and both MagicDNS v4 + v6
+        val dualPlan = ConfigBuilder.build(loggedInState, "singscale-test", enableIpv6 = true)
+        val dualTun = json.parseToJsonElement(dualPlan.configJson)
+            .jsonObject["inbounds"]!!.jsonArray[0].jsonObject
+        assertEquals(
+            listOf("100.64.0.100/32", "fd7a:115c:a1e0::abc1/128"),
+            dualTun["address"]!!.jsonArray.map { it.jsonPrimitive.content }
+        )
+        assertEquals(
+            listOf("100.100.100.100", "fd7a:115c:a1e0::53"),
+            dualTun["dns_address"]!!.jsonArray.map { it.jsonPrimitive.content }
+        )
+
+        // 5. Toggling allowTailnetInboundLocalForward is live-RPC managed and does NOT force TUN reload
+        assertTrue(PolicyThresholds().allowTailnetInboundLocalForward)
+        val disabledInboundPlan = ConfigBuilder.build(
+            loggedInState.copy(thresholds = loggedInState.thresholds.copy(allowTailnetInboundLocalForward = false)),
+            "singscale-test",
+            enableIpv6 = false
+        )
+        assertEquals(v4Plan.reloadFingerprint, disabledInboundPlan.reloadFingerprint)
+    }
+
+    @Test
+    fun `tun address rebind guard performs one-shot upgrade without reentrancy or flapping loops`() {
+        val guard = TunAddressRebindGuard(
+            minRebindIntervalMs = 10_000L,
+            failureBackoffMs = 30_000L,
+            maxFailuresPerTarget = 2,
+            windowMs = 120_000L,
+            maxRebindsPerWindow = 3
+        )
+        var clock = 1_000_000L
+
+        // Before login / non-Running / invalid IP -> never triggers rebind
+        assertEquals(TunRebindDecision.SKIP_NOT_RUNNING, guard.evaluateAndBegin("NeedsLogin", "100.64.0.100", clock).first)
+        assertEquals(TunRebindDecision.SKIP_INVALID_IP, guard.evaluateAndBegin("Running", "100.100.100.100", clock).first)
+        assertEquals(TunRebindDecision.SKIP_INVALID_IP, guard.evaluateAndBegin("Running", "", clock).first)
+
+        // First login acquisition: fallback 172.19.0.1/30 -> 100.64.0.100/32 runs immediately
+        val (d1, target1) = guard.evaluateAndBegin("Running", "100.64.0.100", clock)
+        assertEquals(TunRebindDecision.REBIND_REQUIRED, d1)
+        assertEquals("100.64.0.100/32", target1)
+
+        // Concurrent/duplicate snapshot while in flight is strictly suppressed (reentrancy guard)
+        assertEquals(TunRebindDecision.SKIP_IN_FLIGHT, guard.evaluateAndBegin("Running", "100.64.0.100", clock + 200L).first)
+
+        // Rebind completes -> subsequent snapshots with same IP are strict NO_CHANGE
+        guard.markRebindSucceeded(target1, clock + 500L)
+        assertEquals("100.64.0.100/32", guard.currentAppliedCidr())
+        assertEquals(TunRebindDecision.NO_CHANGE, guard.evaluateAndBegin("Running", "100.64.0.100", clock + 1_000L).first)
+
+        // Rapid IP change within cooldown window is blocked
+        assertEquals(TunRebindDecision.SKIP_COOLDOWN, guard.evaluateAndBegin("Running", "100.64.0.101", clock + 3_000L).first)
+
+        // After cooldown, 2nd & 3rd changes succeed, then 4th within 120s window hits loop cap!
+        clock += 15_000L
+        assertEquals(TunRebindDecision.REBIND_REQUIRED, guard.evaluateAndBegin("Running", "100.64.0.101", clock).first)
+        guard.markRebindSucceeded("100.64.0.101/32", clock + 100L)
+
+        clock += 15_000L
+        assertEquals(TunRebindDecision.REBIND_REQUIRED, guard.evaluateAndBegin("Running", "100.64.0.102", clock).first)
+        guard.markRebindSucceeded("100.64.0.102/32", clock + 100L)
+
+        clock += 15_000L
+        assertEquals(TunRebindDecision.SKIP_LOOP_LIMIT_REACHED, guard.evaluateAndBegin("Running", "100.64.0.103", clock).first)
+
+        // Failure backoff and per-target retry cap prevent crash-retry storms
+        guard.reset()
+        val failClock = 2_000_000L
+        assertEquals(TunRebindDecision.REBIND_REQUIRED, guard.evaluateAndBegin("Running", "100.64.1.2", failClock).first)
+        guard.markRebindFailed("100.64.1.2/32", failClock + 100L)
+        assertEquals(TunRebindDecision.SKIP_COOLDOWN, guard.evaluateAndBegin("Running", "100.64.1.2", failClock + 5_000L).first)
+        assertEquals(TunRebindDecision.REBIND_REQUIRED, guard.evaluateAndBegin("Running", "100.64.1.2", failClock + 35_000L).first)
+        guard.markRebindFailed("100.64.1.2/32", failClock + 35_100L)
+        assertEquals(TunRebindDecision.SKIP_LOOP_LIMIT_REACHED, guard.evaluateAndBegin("Running", "100.64.1.2", failClock + 90_000L).first)
+    }
+
+    @Test
+    fun `repository preserves cached self tailscale ip across transient startup placeholder snapshots`() {
+        SingScaleRepository.clearAuthStateOnLogout()
+        SingScaleRepository.updateTailnetSnapshot(
+            backendState = "Running",
+            authUrl = "",
+            hasSavedLogin = true,
+            tailnetName = "example.ts.net",
+            magicDnsSuffix = "example.ts.net",
+            selfPeer = TailnetPeer(
+                stableId = "self-1",
+                hostName = "android-device",
+                tailscaleIPs = listOf("100.64.0.100")
+            ),
+            peers = emptyList(),
+            reportedExitNodeId = ""
+        )
+        assertEquals("100.64.0.100", SingScaleRepository.state.value.selfPeer?.primaryIpv4)
+
+        // Transient "Starting" placeholder with empty tailscaleIPs MUST NOT wipe cached 100.x IP
+        SingScaleRepository.updateTailnetSnapshot(
+            backendState = "Starting",
+            authUrl = "",
+            hasSavedLogin = true,
+            tailnetName = "example.ts.net",
+            magicDnsSuffix = "example.ts.net",
+            selfPeer = TailnetPeer(
+                stableId = "self-placeholder",
+                hostName = "localhost",
+                tailscaleIPs = emptyList()
+            ),
+            peers = emptyList(),
+            reportedExitNodeId = ""
+        )
+        assertEquals("100.64.0.100", SingScaleRepository.state.value.selfPeer?.primaryIpv4)
+
+        // Explicit logout clears selfPeer so next start falls back to 172.19.0.1/30
+        SingScaleRepository.clearAuthStateOnLogout()
+        assertNull(SingScaleRepository.state.value.selfPeer)
+    }
+
+    @Test
+    fun `oom process rss budget leaves headroom for single-process compose ui and libbox without false triggers`() {
+        val gib = 1024L * 1024L * 1024L
+        val mib = 1024L * 1024L
+
+        assertEquals(384L * mib, SingScaleApp.computeOomProcessRssBudgetBytes(0L))
+        assertEquals(384L * mib, SingScaleApp.computeOomProcessRssBudgetBytes(4L * gib))
+        assertEquals(512L * mib, SingScaleApp.computeOomProcessRssBudgetBytes(6L * gib))
+        assertEquals(640L * mib, SingScaleApp.computeOomProcessRssBudgetBytes(8L * gib))
+        assertEquals(640L * mib, SingScaleApp.computeOomProcessRssBudgetBytes(12L * gib))
     }
 }

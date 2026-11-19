@@ -196,3 +196,11 @@ func (s *CommandServer) SingScaleSetPowerMode(endpointTag string, sleeping bool,
 	}
 	tsEp.SingScaleSetPowerMode(sleeping, networkUp)
 }
+
+func (s *CommandServer) SingScaleSetInboundLocalForward(endpointTag string, enabled bool) {
+	tsEp, err := s.resolveSingScaleTailscale(endpointTag)
+	if err != nil {
+		return
+	}
+	tsEp.SingScaleSetInboundLocalForward(enabled)
+}

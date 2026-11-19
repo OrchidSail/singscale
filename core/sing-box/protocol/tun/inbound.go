@@ -322,10 +322,13 @@ func (t *Inbound) Tag() string {
 func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
-		if t.tunOptions.DNSModeOrDefault() != tun.DNSModeDisabled && len(t.tunOptions.DNSAddress) == 0 {
-			inet4DNSAddress, _ := t.tunOptions.Inet4DNSAddress()
-			inet6DNSAddress, _ := t.tunOptions.Inet6DNSAddress()
-			t.dnsHijackAddress = append(inet4DNSAddress, inet6DNSAddress...)
+		if t.tunOptions.DNSModeOrDefault() != tun.DNSModeDisabled {
+			ensureHostPrefixDNSFallback(&t.tunOptions)
+			if len(t.tunOptions.DNSAddress) == 0 {
+				inet4DNSAddress, _ := t.tunOptions.Inet4DNSAddress()
+				inet6DNSAddress, _ := t.tunOptions.Inet6DNSAddress()
+				t.dnsHijackAddress = append(inet4DNSAddress, inet6DNSAddress...)
+			}
 		}
 	case adapter.StartStateStart:
 		if !t.usePlatformInterface &&

@@ -5,7 +5,6 @@ package oomprofile
 import (
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -16,20 +15,6 @@ import (
 
 type stackRecord struct {
 	Stack []uintptr
-}
-
-type memProfileRecord struct {
-	AllocBytes, FreeBytes     int64
-	AllocObjects, FreeObjects int64
-	Stack                     []uintptr
-}
-
-func (r *memProfileRecord) InUseBytes() int64 {
-	return r.AllocBytes - r.FreeBytes
-}
-
-func (r *memProfileRecord) InUseObjects() int64 {
-	return r.AllocObjects - r.FreeObjects
 }
 
 type blockProfileRecord struct {
@@ -336,13 +321,8 @@ func writeHeapProto(w io.Writer, profile []memProfileRecord, rate int64, default
 			hideRuntime = false
 		}
 
-		values[0], values[1] = scaleHeapSample(record.AllocObjects, record.AllocBytes, rate)
-		values[2], values[3] = scaleHeapSample(record.InUseObjects(), record.InUseBytes(), rate)
-
 		var blockSize int64
-		if record.AllocObjects > 0 {
-			blockSize = record.AllocBytes / record.AllocObjects
-		}
+		values[0], values[1], values[2], values[3], blockSize = record.sampleValues(rate)
 		builder.pbSample(values, locs, func() {
 			if blockSize != 0 {
 				builder.pbLabel(tagSample_Label, "bytes", "", blockSize)
@@ -351,19 +331,6 @@ func writeHeapProto(w io.Writer, profile []memProfileRecord, rate int64, default
 	}
 
 	return builder.build()
-}
-
-func scaleHeapSample(count int64, size int64, rate int64) (int64, int64) {
-	if count == 0 || size == 0 {
-		return 0, 0
-	}
-	if rate <= 1 {
-		return count, size
-	}
-
-	avgSize := float64(size) / float64(count)
-	scale := 1 / (1 - math.Exp(-avgSize/float64(rate)))
-	return int64(float64(count) * scale), int64(float64(size) * scale)
 }
 
 type profileBuilder struct {

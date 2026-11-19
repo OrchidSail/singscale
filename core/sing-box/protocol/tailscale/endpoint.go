@@ -128,6 +128,9 @@ type Endpoint struct {
 	keyAuth             bool
 	started             atomic.Bool
 	systemDialer        *dialer.DefaultDialer
+
+	inboundForwarder      atomic.Pointer[tailnetLocalForwarder]
+	allowLocalPortForward atomic.Bool
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TailscaleEndpointOptions) (adapter.Endpoint, error) {
@@ -188,7 +191,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	taildropDirectory = filemanager.BasePath(ctx, os.ExpandEnv(taildropDirectory))
 	taildropDirectory, _ = filepath.Abs(taildropDirectory)
-	return &Endpoint{
+	ep := &Endpoint{
 		Adapter:           endpoint.NewAdapter(C.TypeTailscale, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, nil),
 		ctx:               ctx,
 		router:            router,
@@ -246,7 +249,9 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		systemInterfaceName:        options.SystemInterfaceName,
 		systemInterfaceMTU:         options.SystemInterfaceMTU,
 		keyAuth:                    options.AuthKey != "",
-	}, nil
+	}
+	ep.allowLocalPortForward.Store(true)
+	return ep, nil
 }
 
 func (t *Endpoint) References() []string {
@@ -441,7 +446,22 @@ func (t *Endpoint) postStart(scope *adapter.Scope) error {
 		return err
 	}
 	scope.Add(t.server.Close)
+	inboundFwd := newTailnetLocalForwarder(scope.Context(), tailnetLocalForwarderOptions{
+		Enabled:    t.allowLocalPortForward.Load(),
+		Logger:     t.logger,
+		VerifyPeer: t.verifyAuthenticatedTailnetPeer,
+		IsSelfIP:   t.isSelfTailscaleIP,
+	})
+	t.inboundForwarder.Store(inboundFwd)
+	scope.Add(func() error {
+		t.inboundForwarder.Store(nil)
+		return inboundFwd.Close()
+	})
 	fallbackTCPCloser := t.server.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
+		if t.isSelfTailscaleIP(dst.Addr()) {
+			// Handle local Tailscale IP flows outside tsnet.Server.mu via netstack.GetTCPHandlerForFlow.
+			return nil, false
+		}
 		return func(conn net.Conn) {
 			ctx := log.ContextWithNewID(t.ctx)
 			source := M.SocksaddrFrom(src.Addr(), src.Port())
@@ -500,6 +520,11 @@ func (t *Endpoint) postStart(scope *adapter.Scope) error {
 					return handler, intercept
 				}
 			}
+			if fwd := t.inboundForwarder.Load(); fwd != nil {
+				if localHandler, localIntercept := fwd.HandleFlow(src, dst); localIntercept {
+					return localHandler, true
+				}
+			}
 			return func(conn net.Conn) {
 				ctx := log.ContextWithNewID(t.ctx)
 				source := M.SocksaddrFrom(src.Addr(), src.Port())
@@ -514,6 +539,12 @@ func (t *Endpoint) postStart(scope *adapter.Scope) error {
 				handler, intercept = previousUDP(src, dst)
 				if handler != nil || !intercept {
 					return handler, intercept
+				}
+			}
+			if t.isSelfTailscaleIP(dst.Addr()) {
+				fwd := t.inboundForwarder.Load()
+				if fwd == nil || !fwd.Enabled() || !t.verifyAuthenticatedTailnetPeer(src.Addr()) {
+					return nil, true
 				}
 			}
 			return func(conn nettype.ConnPacketConn) {

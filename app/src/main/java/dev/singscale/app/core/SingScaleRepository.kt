@@ -31,6 +31,8 @@ object SingScaleRepository {
     private var lastSnapshotPersistMs: Long = 0L
     @Volatile
     private var lastPersistedIdentitySig: String = ""
+    @Volatile
+    private var lastPersistedSelfIp: String = ""
 
     private val _state = MutableStateFlow(SingScaleUiState())
     val state: StateFlow<SingScaleUiState> = _state.asStateFlow()
@@ -54,6 +56,7 @@ object SingScaleRepository {
         val cachedTailnetName: String = "",
         val cachedSelfName: String = "",
         val cachedSelfIp: String = "",
+        val cachedSelfIpv6: String = "",
         val cachedPeers: List<TailnetPeer> = emptyList()
     )
 
@@ -67,13 +70,17 @@ object SingScaleRepository {
         if (!raw.isNullOrBlank()) {
             runCatching {
                 val saved = json.decodeFromString<PersistedSettings>(raw)
-                val cachedSelf = if (diskHasLogin && (saved.cachedSelfName.isNotBlank() || saved.cachedSelfIp.isNotBlank())) {
+                val validCachedV4 = ConfigBuilder.normalizeTailscaleIpv4(saved.cachedSelfIp)
+                val validCachedV6 = ConfigBuilder.normalizeTailscaleIpv6(saved.cachedSelfIpv6)
+                val cachedSelfIps = listOfNotNull(validCachedV4, validCachedV6)
+                val cachedSelf = if (diskHasLogin && (saved.cachedSelfName.isNotBlank() || cachedSelfIps.isNotEmpty())) {
                     TailnetPeer(
                         stableId = "cached-self",
                         hostName = saved.cachedSelfName,
-                        tailscaleIPs = listOfNotNull(saved.cachedSelfIp.takeIf { it.isNotBlank() })
+                        tailscaleIPs = cachedSelfIps
                     )
                 } else null
+                lastPersistedSelfIp = if (diskHasLogin) validCachedV4.orEmpty() else ""
                 val v2Thresholds = if (!saved.rulesMigratedV2) {
                     val cleanedDirect = if (saved.thresholds.customDirectDomains.toSet() == v1LegacyDirectDefaults) {
                         emptyList()
@@ -144,6 +151,8 @@ object SingScaleRepository {
                 quality = LinkQualityMetrics()
             )
         }
+        val normalizedSelfV4 = ConfigBuilder.normalizeTailscaleIpv4(s.selfPeer?.primaryIpv4).orEmpty()
+        val normalizedSelfV6 = ConfigBuilder.normalizeTailscaleIpv6(s.selfPeer?.primaryIpv6).orEmpty()
         val payload = PersistedSettings(
             selectedExitPeerId = s.selectedExitPeerId,
             selectedRelayPeerId = s.selectedRelayPeerId,
@@ -157,11 +166,13 @@ object SingScaleRepository {
             hasSavedLogin = s.hasSavedLogin,
             cachedTailnetName = s.tailnetName,
             cachedSelfName = s.selfPeer?.displayName.orEmpty(),
-            cachedSelfIp = s.selfPeer?.primaryIpv4.orEmpty(),
+            cachedSelfIp = normalizedSelfV4,
+            cachedSelfIpv6 = normalizedSelfV6,
             cachedPeers = compactPeers
         )
         lastSnapshotPersistMs = System.currentTimeMillis()
         lastPersistedIdentitySig = buildIdentitySignature(s)
+        lastPersistedSelfIp = normalizedSelfV4
         runCatching {
             ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
@@ -270,6 +281,19 @@ object SingScaleRepository {
                 }
                 else -> prev.statusMessage
             }
+            val incomingValidIpv4 = ConfigBuilder.normalizeTailscaleIpv4(selfPeer?.primaryIpv4)
+            val mergedSelfPeer = when {
+                selfPeer == null -> prev.selfPeer
+                incomingValidIpv4 != null -> selfPeer
+                backendState != "NeedsLogin" && prev.selfPeer != null && prev.selfPeer.tailscaleIPs.isNotEmpty() -> {
+                    selfPeer.copy(
+                        tailscaleIPs = prev.selfPeer.tailscaleIPs,
+                        hostName = selfPeer.hostName.ifBlank { prev.selfPeer.hostName }
+                    )
+                }
+                else -> selfPeer
+            }
+
             prev.copy(
                 tunnelStatus = nextStatus,
                 statusMessage = nextStatusMsg,
@@ -278,15 +302,17 @@ object SingScaleRepository {
                 authUrl = if (backendState == "Running") "" else authUrl.ifBlank { if (!hasAuthenticatedTailnet) prev.authUrl else "" },
                 tailnetName = effectiveTailnet,
                 magicDnsSuffix = magicDnsSuffix.ifBlank { prev.magicDnsSuffix },
-                selfPeer = selfPeer ?: prev.selfPeer,
+                selfPeer = mergedSelfPeer,
                 peers = mergedPeers,
                 activeExitPeerId = prev.activeExitPeerId.ifBlank { reportedExitNodeId }
             )
         }
         val updated = _state.value
         val newSig = buildIdentitySignature(updated)
+        val latestValidSelfIp = ConfigBuilder.normalizeTailscaleIpv4(updated.selfPeer?.primaryIpv4).orEmpty()
+        val selfIpChanged = latestValidSelfIp.isNotBlank() && latestValidSelfIp != lastPersistedSelfIp
         val now = System.currentTimeMillis()
-        if (newSig != lastPersistedIdentitySig && (lastSnapshotPersistMs == 0L || now - lastSnapshotPersistMs >= 30_000L || updated.hasSavedLogin != (lastPersistedIdentitySig.startsWith("true|")))) {
+        if (selfIpChanged || (newSig != lastPersistedIdentitySig && (lastSnapshotPersistMs == 0L || now - lastSnapshotPersistMs >= 30_000L || updated.hasSavedLogin != (lastPersistedIdentitySig.startsWith("true|"))))) {
             persistCurrent()
         }
     }

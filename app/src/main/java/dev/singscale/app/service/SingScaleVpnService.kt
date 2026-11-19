@@ -27,6 +27,8 @@ import dev.singscale.app.core.SingScaleRepository
 import dev.singscale.app.core.TailnetPeer
 import dev.singscale.app.core.TrafficSplitTracker
 import dev.singscale.app.core.TrafficStats
+import dev.singscale.app.core.TunAddressRebindGuard
+import dev.singscale.app.core.TunRebindDecision
 import dev.singscale.app.core.TunnelStatus
 import dev.singscale.app.widget.SingScaleTileService
 import dev.singscale.app.widget.SingScaleWidgetProvider
@@ -202,6 +204,7 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
     private val reloadMutex = Mutex()
     private val probeMutex = Mutex()
     private val gatewayScanMutex = Mutex()
+    private val tunRebindGuard = TunAddressRebindGuard()
     private val jsonParser = Json { ignoreUnknownKeys = true }
 
     private val tailnetWakeSignal = Channel<Unit>(Channel.CONFLATED)
@@ -493,12 +496,17 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
 
         val inet4 = options.inet4Address
         var hasV4 = false
+        val boundV4Summary = mutableListOf<String>()
         while (inet4.hasNext()) {
             val addr = inet4.next()
             runCatching {
                 builder.addAddress(addr.address(), addr.prefix())
+                boundV4Summary.add("${addr.address()}/${addr.prefix()}")
                 hasV4 = true
             }
+        }
+        if (boundV4Summary.isNotEmpty()) {
+            Log.i(TAG, "openTun binding IPv4 address(es): ${boundV4Summary.joinToString(", ")}")
         }
 
         val inet6 = options.inet6Address
@@ -656,9 +664,16 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
 
                 commandServer?.startOrReloadService(plan.configJson, overrideOpts)
                 currentInstanceEpoch = instanceEpochGen.incrementAndGet()
+                tunRebindGuard.recordAppliedExternal(plan.tunIpv4Address)
 
                 runCatching {
                     commandServer?.singScaleSelectOutbound(ConfigBuilder.OUTBOUND_SELECTOR, plan.primaryEgressTag)
+                }
+                runCatching {
+                    commandServer?.singScaleSetInboundLocalForward(
+                        ConfigBuilder.ENDPOINT_TAG,
+                        curInitState.thresholds.allowTailnetInboundLocalForward
+                    )
                 }
 
                 SingScaleRepository.updateTunnelStatus(
@@ -973,7 +988,23 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
                                 requestInteractiveLoginNow()
                             }
 
-                            if (dto.backendState == "Running" && domainPeers.isNotEmpty()) {
+                            var tunRebindDispatched = false
+                            if (dto.backendState == "Running" && dto.self != null) {
+                                val reportedSelfIpv4 = dto.self.tailscaleIPs.firstOrNull { !it.contains(':') }
+                                val (rebindDecision, targetCidr) = tunRebindGuard.evaluateAndBegin(
+                                    backendState = dto.backendState,
+                                    rawSelfIpv4 = reportedSelfIpv4,
+                                    nowMs = now
+                                )
+                                if (rebindDecision == TunRebindDecision.REBIND_REQUIRED) {
+                                    tunRebindDispatched = true
+                                    launch {
+                                        performSmoothTunAddressRebind(targetCidr)
+                                    }
+                                }
+                            }
+
+                            if (!tunRebindDispatched && dto.backendState == "Running" && domainPeers.isNotEmpty()) {
                                 val hasUnprobedOnline = SingScaleRepository.state.value.peers.any {
                                     it.online && !it.expired && it.primaryIpv4.isNotBlank() &&
                                         it.gatewayProbeStatus == GatewayProbeStatus.UNPROBED
@@ -1280,6 +1311,7 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
                     currentInstanceEpoch = instanceEpochGen.incrementAndGet()
                     lastAppliedConfigJson = plan.configJson
                     lastAppliedReloadFingerprint = plan.reloadFingerprint
+                    tunRebindGuard.recordAppliedExternal(plan.tunIpv4Address)
                     if (AppPowerStateMonitor.state.value.shouldStreamLiveUiTelemetry) {
                         startStatusStreamClient()
                     }
@@ -1334,7 +1366,45 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
                     DefaultNetworkMonitor.hasPhysicalNetwork.value
                 )
             }
+            runCatching {
+                srv.singScaleSetInboundLocalForward(
+                    ConfigBuilder.ENDPOINT_TAG,
+                    freshState.thresholds.allowTailnetInboundLocalForward
+                )
+            }
             refreshNotification()
+        }
+    }
+
+    /**
+     * Smoothly rebinds `tun0` to the authenticated node's real Tailscale `100.x/32` IP
+     * (guarded by [TunAddressRebindGuard] against reentrancy, flapping, and failure storms).
+     */
+    private suspend fun performSmoothTunAddressRebind(targetCidr: String) {
+        var succeeded = false
+        try {
+            reapplyRoutingConfiguration(forceReloadIfConfigDiffers = true)
+            succeeded = (tunRebindGuard.currentAppliedCidr() == targetCidr)
+            if (succeeded) {
+                val ipOnly = targetCidr.substringBefore('/')
+                Log.i(TAG, "TUN smoothly rebound to Tailscale node address $targetCidr")
+                SingScaleRepository.appendDecision(
+                    title = "TUN 网卡已绑定本机 Tailscale IP ($ipOnly)",
+                    detail = "无线调试地址与组网接口已统一为 $targetCidr，支持组网设备直连本机端口",
+                    badge = "TUN 100.x"
+                )
+                refreshNotification(force = true)
+                tailnetWakeSignal.trySend(Unit)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Smooth TUN address rebind to $targetCidr failed: ${e.message}")
+        } finally {
+            val now = System.currentTimeMillis()
+            if (succeeded) {
+                tunRebindGuard.markRebindSucceeded(targetCidr, now)
+            } else {
+                tunRebindGuard.markRebindFailed(targetCidr, now)
+            }
         }
     }
 
@@ -1389,6 +1459,7 @@ class SingScaleVpnService : VpnService(), SingScalePlatformInterface, CommandSer
     }
 
     private fun cleanupResources() {
+        tunRebindGuard.reset()
         powerObserverJob?.cancel()
         powerObserverJob = null
         tailnetWatchJob?.cancel()

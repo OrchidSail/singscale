@@ -505,6 +505,16 @@ fun PolicyScreen(
                 )
 
                 PolicySwitchRow(
+                    title = "允许组网设备直连本机端口",
+                    subtitle = "将 Tailnet 认证节点访问本机 100.x:<端口>（如无线调试 ADB / SSH）透明转发至本机回环，绝不暴露公网",
+                    checked = t.allowTailnetInboundLocalForward,
+                    onCheckedChange = { v ->
+                        SingScaleRepository.updateThresholds { it.copy(allowTailnetInboundLocalForward = v) }
+                        SingScaleVpnService.notifyPolicyOrNodeChanged(context)
+                    }
+                )
+
+                PolicySwitchRow(
                     title = "自动接受组网子网路由",
                     subtitle = "接管远端节点宣告的内网网段",
                     checked = t.acceptSubnetRoutes,

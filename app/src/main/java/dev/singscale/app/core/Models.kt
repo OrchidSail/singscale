@@ -156,6 +156,9 @@ data class TailnetPeer(
     val primaryIpv4: String
         get() = tailscaleIPs.firstOrNull { !it.contains(':') } ?: tailscaleIPs.firstOrNull().orEmpty()
 
+    val primaryIpv6: String
+        get() = tailscaleIPs.firstOrNull { it.contains(':') }.orEmpty()
+
     val effectivePathType: TransportPathType
         get() = when {
             quality.updatedAtMs > 0L && quality.reachable -> quality.pathType
@@ -236,6 +239,7 @@ data class PolicyThresholds(
     val failSafeDirectFallback: Boolean = true,
     val allowLanAccess: Boolean = true,
     val acceptSubnetRoutes: Boolean = true,
+    val allowTailnetInboundLocalForward: Boolean = true,
     val forcedRelayDomains: List<String> = emptyList(),
     val customDirectDomains: List<String> = emptyList(),
     val customProxyDomains: List<String> = emptyList()

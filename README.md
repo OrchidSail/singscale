@@ -22,20 +22,32 @@
 - **主动链路质量评估引擎（`QualityEngine`）**：并发执行 Tailscale Disco Ping（识别 `DIRECT` P2P 直连 / `PEER_RELAY` / `DERP` 路径、RTT、抖动与丢包）并结合 HTTPS 204 端到端测速，给出 `0–100` 评分与 `S / A / B / C` 等级；支持滞回防抖自动优选、DERP 高延迟降级保护与出口离线故障安全直连回退（Fail-Safe）。
 - **现代原生 UI 与分流透视**：采用 Kotlin + Jetpack Compose + Material 3 打造「连接」「分流」「节点」「设置」四大页面，提供双路（中继 vs 直连）实时速率折线图、按域名/连接粒度的流量透视与命中规则说明。
 
-### 3. Quick Settings 快捷磁贴与双尺寸桌面小组件
+### 3. 动态 `100.x/32` TUN 绑定与被动事件驱动本机端口透传（v1.0.4）
+- **动态 `100.x/32` TUN 地址绑定（无线调试直显 Tailscale 地址）**：
+  - 登录后自动将 Android `tun0` 接口地址平滑绑定为本机真实 Tailscale CGNAT 地址（`100.x.y.z/32`，开启 IPv6 时双栈绑定 `fd7a:...:/128`）并自动关联 MagicDNS（`100.100.100.100` / `fd7a:115c:a1e0::53`），让 Android 系统「无线调试（Wireless Debugging）」等系统组件直接显示本机 Tailscale 地址。
+  - 登录前及登出后自动安全回退至 `172.19.0.1/30`；由 `TunAddressRebindGuard` 状态机保证一次性平滑切换，内置防重入、冷却时间与滑动窗口频次上限，杜绝地址抖动循环；Go 侧 `ensureHostPrefixDNSFallback` 为 `/32`、`/128` 单主机前缀提供 MagicDNS 兜底保护。
+- **被动事件驱动 Tailnet 入站本机端口透传与 UI 实时开关**：
+  - 通过 `tsnet` 用户态 netstack 回调被动接管发往本机 Tailscale IP 的 TCP 入站流（如无线调试 ADB、Termux SSH 等本机服务），严格核验源 IP 属于当前 Tailnet 已认证且未过期节点后，直接透明转发至 Android OS 回环（`127.0.0.1`，失败自动回退 `[::1]`），不经公网也不回环重入 `tun0`。
+  - 纯事件驱动、零后台 goroutine、零定时器、息屏零唤醒；内置全局与单节点并发上限及完整 TCP 半关闭（`CloseWrite`）回收。
+  - 在「分流」页提供 **「允许组网设备直连本机端口」** 实时开关，通过 RPC 毫秒级热切换（无需重载 TUN），关闭时立即断开存量转发并拒绝新入站连接。
+
+### 4. Quick Settings 快捷磁贴与双尺寸桌面小组件
 - **下拉状态栏快捷磁贴（`SingScaleTileService`）**：随时一键启停 VPN，实时展示当前活跃节点与延迟。
 - **双尺寸桌面小组件**：
   - `1×1` 极简快捷开关（`SingScaleMiniWidgetProvider`）：Canvas 抗锯齿绘制，单指一键启停。
   - `4×2` 状态卡片（`SingScaleWidgetProvider`）：显示节点、链路类型与延迟，并支持在小组件上直接循环切换路由策略。
 - **零周期轮询开销**：小组件配置 `updatePeriodMillis="0"` 纯事件驱动，结合息屏静默与延迟分桶，避免无效 SystemUI / Launcher IPC 唤醒。
 
-### 4. 切网 / 弱网防崩溃稳定性优化
+### 5. 切网 / 弱网防崩溃、Go 1.27 兼容与内存预算解耦
 - **非法蜂窝/CLAT 前缀防崩溃**：Go 端 `parseInterfacePrefixes` 与 Kotlin 端 `formatValidatedCidrPrefix` 双重校验，安全过滤 Android 蜂窝切网瞬态上报的非法前缀（如 `-1`、IPv4 `/128`、带 `%iface` 作用域的 IPv6），避免触发 `netip.MustParsePrefix` panic。
 - **接口变更签名去重**：`DefaultNetworkMonitor` 按网络句柄、接口名、计费状态、DNS 与地址列表计算拓扑签名，过滤 RSRP 信号格抖动引发的无效回调，同时在 Wi-Fi / 5G 真实切换时及时同步 `setUnderlyingNetworks`。
 - **本地 DNS 并发闸门**：`LocalResolver` 通过并发信号量（上限 `16`）与 4 秒超时约束 Go→Java JNI 解析调用，防止弱网/断网期间线程数失控。
-- **并发关闭保护与内存预算**：Tailscale 端点关闭期采用 `safeLocalBackend()` 与 `recover()` 保护；配置 Go 软内存上限（`oomMemoryLimit` 144 MB / 192 MB）及已关闭连接缓存上限，降低后台被 Android LMK 强杀风险；启用局域网访问时通过 CIDR 精确扣减，保留局域网直通与已接受的 Tailnet 子网路由。
+- **Go 1.27 兼容与进程 RSS / Go 堆内存预算解耦**：
+  - `oomprofile` 按 `go1.27` / `!go1.27` 构建标签自动适配 Go 1.27 内存剖析记录 ABI 布局，并为 OOM 快照生成补充 `recover()` 兜底保护，防止异常诊断过程引发二次崩溃。
+  - 将 Android 单进程总 VmRSS 守护上限（`oomMemoryLimit` 按设备内存分级为 `384 / 512 / 640 MiB`，覆盖 ART、Jetpack Compose、HWUI 与 `libbox.so`）与 Go 自身堆软预算（`GOMEMLIMIT` 独立约束于 `96–160 MiB`、`GOGC=50`）解耦，在保持后台 VPN 紧凑内存的同时避免前台 UI 交互触发误报 OOM 重置。
+  - Tailscale 端点关闭期采用 `safeLocalBackend()` 与 `recover()` 保护；启用局域网访问时通过 CIDR 精确扣减，保留局域网直通与已接受的 Tailnet 子网路由。
 
-### 5. 三态低功耗调度（息屏极致省电）
+### 6. 三态低功耗调度（息屏极致省电）
 通过 `AppPowerStateMonitor` 感知屏幕交互状态、应用前后台与系统省电模式（不持有任何 `WakeLock`），联动 Go 内核实现三态电源调度：
 
 | 运行状态 | 实时 UI 遥测流 | Tailnet 状态轮询 | 主动链路探测（Disco / HTTP） | 内核与射频优化 |
@@ -58,17 +70,19 @@ singscale/
 │       ├── main/
 │       │   ├── AndroidManifest.xml
 │       │   ├── java/dev/singscale/app/
-│       │   │   ├── core/                     # 数据模型、sing-box 配置构建器、质量引擎、分流追踪、三态功耗监控
+│       │   │   ├── core/                     # 数据模型、sing-box 配置构建器、质量引擎、分流追踪、三态功耗监控、TUN 动态绑定状态机
 │       │   │   ├── service/                  # VpnService、PlatformInterface、物理网络监听、并发受控本地 DNS
 │       │   │   ├── widget/                   # 1×1 / 4×2 桌面小组件、Canvas 渲染与 Quick Settings 快捷磁贴
 │       │   │   └── ui/                       # 主题、可视化组件与连接/分流/节点/设置页面
 │       │   └── res/                          # 图标、小组件布局与主题资源
-│       └── test/java/dev/singscale/app/      # 引擎、路由、功耗与切网防崩溃单元测试
+│       └── test/java/dev/singscale/app/      # 引擎、路由、功耗、TUN 绑定与切网防崩溃单元测试
 ├── core/sing-box/                            # 基于 sing-box v1.14.4 定制扩展的 Go 内核源码
 │   ├── adapter/singscale.go                  # SingScale Tailscale 扩展接口契约
 │   ├── protocol/tailscale/singscale_ext.go   # Tailnet 快照、MaskedPrefs 热更新、Disco 探测、网关扫描与休眠控制
+│   ├── protocol/tailscale/singscale_inbound.go # 被动事件驱动 Tailnet 入站本机回环端口透传引擎
+│   ├── protocol/tun/singscale_dns_fallback.go  # /32 与 /128 单主机前缀 MagicDNS 兜底保护
 │   ├── route/singscale_direct_first.go       # 直连优先 TCP+TLS RTT 探测与结果缓存引擎
-│   └── experimental/libbox/                  # Android gomobile 绑定、SingScale RPC 与切网前缀安全解析
+│   └── experimental/libbox/                  # Android gomobile 绑定、SingScale RPC、Go 1.27 OOM 剖析兼容与内存预算解耦
 ├── scripts/
 │   ├── build_libbox.ps1                      # 从 core/sing-box 编译生成 app/libs/libbox.aar
 │   └── build_apk.ps1                         # 自动检查/构建内核并打包 Debug/Release APK
@@ -82,7 +96,7 @@ singscale/
 ## 构建与开发说明
 
 ### 环境要求
-- **Go**：`1.24+`（需位于 `PATH` 中）
+- **Go**：`1.24+`（已兼容 Go 1.27，需位于 `PATH` 中）
 - **SagerNet gomobile**：用于将 `core/sing-box/experimental/libbox` 绑定为 Android AAR
   ```bash
   go install -v github.com/sagernet/gomobile/cmd/gomobile@latest
@@ -105,7 +119,7 @@ Linux / macOS 可在 `core/sing-box` 目录下使用相同的 `gomobile bind` �
 ```bash
 # 运行 Go 扩展单元测试
 cd core/sing-box
-go test -ldflags="-checklinkname=0" -tags "with_gvisor,with_tailscale,badlinkname,tfogo_checklinkname0" ./route ./protocol/tailscale ./experimental/libbox
+go test -ldflags="-checklinkname=0" -tags "with_gvisor,with_tailscale,badlinkname,tfogo_checklinkname0" ./route ./protocol/tailscale ./protocol/tun ./experimental/libbox ./experimental/libbox/internal/oomprofile ./experimental/libbox/internal/runtimeinfo ./service/oomkiller
 
 # 返回仓库根目录运行 Android 单元测试与 Debug 包构建
 ./gradlew :app:testDebugUnitTest :app:assembleDebug

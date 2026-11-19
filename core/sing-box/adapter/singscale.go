@@ -30,4 +30,5 @@ type SingScaleTailscaleEndpoint interface {
 		timeoutMs int32,
 	) (string, error)
 	SingScaleSetPowerMode(sleeping bool, networkUp bool)
+	SingScaleSetInboundLocalForward(enabled bool)
 }

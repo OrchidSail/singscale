@@ -57,6 +57,25 @@ class SingScaleApp : Application() {
             File(context.filesDir, "tailscale").also { it.mkdirs() }
 
         /**
+         * Computes the Android single-process VmRSS OOM killer ceiling passed to libbox's
+         * `oomkiller` service (which reads `/proc/self/statm` total process RSS, including
+         * ART, Jetpack Compose, HWUI/Vulkan, and 63.5MB `libbox.so`).
+         *
+         * Go's own heap soft limit (`GOMEMLIMIT`) is capped separately inside `libbox/setup.go`
+         * at 128–160 MiB with `GOGC=50`, so background VPN memory stays lean while foreground UI
+         * activity never triggers false-positive `ResetNetwork()` / 100ms OOM polling storms.
+         */
+        fun computeOomProcessRssBudgetBytes(totalRamBytes: Long): Long {
+            val gib = 1024L * 1024L * 1024L
+            val mib = 1024L * 1024L
+            return when {
+                totalRamBytes >= 8L * gib -> 640L * mib
+                totalRamBytes >= 6L * gib -> 512L * mib
+                else -> 384L * mib
+            }
+        }
+
+        /**
          * Inspects Tailscale's FileStore (`tailscaled.state`) in app-private internal storage
          * to determine whether a valid, non-logged-out PrivateNodeKey already exists on disk.
          */
@@ -162,12 +181,9 @@ class SingScaleApp : Application() {
                 am?.getMemoryInfo(memInfo)
                 memInfo.totalMem
             }.getOrDefault(0L)
-            // Soft memory budget protects background VPN from Android LMK / OOM kills
-            val goMemoryBudgetBytes = if (totalRamBytes >= 6L * 1024L * 1024L * 1024L) {
-                192L * 1024L * 1024L
-            } else {
-                144L * 1024L * 1024L
-            }
+            // Process-level RSS ceiling protects background VPN from Android LMK / runaway leaks
+            // without false-triggering when foreground Compose UI + libbox.so share this process.
+            val processRssBudgetBytes = computeOomProcessRssBudgetBytes(totalRamBytes)
 
             val options = SetupOptions().apply {
                 basePath = baseDir.absolutePath
@@ -181,7 +197,7 @@ class SingScaleApp : Application() {
                 appMarketingVersion = BuildConfig.VERSION_NAME
                 oomKillerEnabled = true
                 oomKillerDisabled = false
-                oomMemoryLimit = goMemoryBudgetBytes
+                oomMemoryLimit = processRssBudgetBytes
             }
             Libbox.setup(options)
         }

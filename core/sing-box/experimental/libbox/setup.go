@@ -106,13 +106,41 @@ func ReloadSetupOptions(options *SetupOptions) {
 			if C.IsAndroid || C.IsIos {
 				debug.SetGCPercent(oomkiller.DefaultAppleNetworkExtensionGCPercent)
 			}
-			debug.SetMemoryLimit(sOOMMemoryLimit * 4 / 5)
+			debug.SetMemoryLimit(computeGoMemoryLimit(sOOMMemoryLimit, C.IsAndroid))
 		} else {
 			debug.SetMemoryLimit(math.MaxInt64)
 		}
 	} else {
 		debug.SetMemoryLimit(math.MaxInt64)
 	}
+}
+
+func computeGoMemoryLimit(oomMemoryLimit int64, isAndroid bool) int64 {
+	if oomMemoryLimit <= 0 {
+		return math.MaxInt64
+	}
+	goMemLimit := oomMemoryLimit * 4 / 5
+	if isAndroid {
+		// On single-process Android apps, oomMemoryLimit guards total process RSS
+		// (ART + Compose/HWUI + libbox.so + Go). Keep Go's own soft heap limit
+		// compact so background VPN memory stays lean while avoiding false
+		// process-RSS OOM resets when foreground UI is active.
+		const (
+			minAndroidGoSoftLimit = 96 * 1024 * 1024
+			maxAndroidGoSoftLimit = 160 * 1024 * 1024
+		)
+		androidGoSoftLimit := oomMemoryLimit / 3
+		if androidGoSoftLimit < minAndroidGoSoftLimit {
+			androidGoSoftLimit = minAndroidGoSoftLimit
+		}
+		if androidGoSoftLimit > maxAndroidGoSoftLimit {
+			androidGoSoftLimit = maxAndroidGoSoftLimit
+		}
+		if androidGoSoftLimit < goMemLimit {
+			goMemLimit = androidGoSoftLimit
+		}
+	}
+	return goMemLimit
 }
 
 func Setup(options *SetupOptions) error {

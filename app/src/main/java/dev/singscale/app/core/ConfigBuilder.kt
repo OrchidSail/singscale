@@ -30,6 +30,11 @@ object ConfigBuilder {
     const val OUTBOUND_EXIT = "peer-exit"
     const val OUTBOUND_SELECTOR = "egress-select"
 
+    const val FALLBACK_TUN_IPV4_CIDR = "172.19.0.1/30"
+    const val FALLBACK_TUN_IPV6_CIDR = "fdfe:dcba:9876::1/126"
+    const val TAILSCALE_MAGIC_DNS_IPV4 = "100.100.100.100"
+    const val TAILSCALE_MAGIC_DNS_IPV6 = "fd7a:115c:a1e0::53"
+
     private val prettyJson = Json {
         prettyPrint = true
         encodeDefaults = false
@@ -42,8 +47,55 @@ object ConfigBuilder {
         val nativeExitNodeTarget: String,
         val usesProxyExit: Boolean,
         val usesProxyRelay: Boolean,
-        val directFirstActive: Boolean
+        val directFirstActive: Boolean,
+        val tunIpv4Address: String = FALLBACK_TUN_IPV4_CIDR,
+        val usesTailscaleTunIp: Boolean = false
     )
+
+    /**
+     * Validates and canonicalizes a Tailscale CGNAT IPv4 address (`100.64.0.0/10`),
+     * rejecting malformed strings, non-CGNAT IPs, network/broadcast edges, and
+     * Tailscale's reserved Quad100 MagicDNS address (`100.100.100.100`).
+     */
+    fun normalizeTailscaleIpv4(raw: String?): String? {
+        val cleaned = raw?.trim()?.substringBefore('/')?.substringBefore('%').orEmpty()
+        if (cleaned.isEmpty()) return null
+        val octets = cleaned.split('.')
+        if (octets.size != 4) return null
+        val parsed = IntArray(4)
+        for (i in 0 until 4) {
+            val part = octets[i]
+            if (part.isEmpty() || part.length > 3 || !part.all { it.isDigit() }) return null
+            val v = part.toIntOrNull() ?: return null
+            if (v !in 0..255) return null
+            parsed[i] = v
+        }
+        // Must fall inside Tailscale CGNAT range 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+        if (parsed[0] != 100 || parsed[1] !in 64..127) return null
+        // Exclude reserved Quad100 service IP and CGNAT range network/broadcast boundaries
+        if (parsed[1] == 100 && parsed[2] == 100 && parsed[3] == 100) return null
+        if (parsed[1] == 64 && parsed[2] == 0 && parsed[3] == 0) return null
+        if (parsed[1] == 127 && parsed[2] == 255 && parsed[3] == 255) return null
+        return "${parsed[0]}.${parsed[1]}.${parsed[2]}.${parsed[3]}"
+    }
+
+    /**
+     * Validates a Tailscale node ULA IPv6 address (`fd7a:115c:a1e0::/48`),
+     * excluding Tailscale's reserved IPv6 MagicDNS service address (`fd7a:115c:a1e0::53`).
+     */
+    fun normalizeTailscaleIpv6(raw: String?): String? {
+        val cleaned = raw?.trim()?.substringBefore('/')?.substringBefore('%')?.lowercase().orEmpty()
+        if (cleaned.isEmpty() || !cleaned.contains(':')) return null
+        if (!cleaned.startsWith("fd7a:115c:a1e0:")) return null
+        if (cleaned == TAILSCALE_MAGIC_DNS_IPV6) return null
+        if (!cleaned.all { it in '0'..'9' || it in 'a'..'f' || it == ':' }) return null
+        return cleaned
+    }
+
+    fun resolveTunIpv4Cidr(selfIpv4Raw: String?): String {
+        val validIp = normalizeTailscaleIpv4(selfIpv4Raw)
+        return if (validIp != null) "$validIp/32" else FALLBACK_TUN_IPV4_CIDR
+    }
 
     fun build(
         state: SingScaleUiState,
@@ -210,6 +262,15 @@ object ConfigBuilder {
             emptyList()
         }
 
+        // Resolve TUN IPv4/IPv6 addresses: bind the node's real Tailscale 100.x/32 IP when known
+        // so Android Wireless Debugging displays 100.x.y.z:<port>, falling back safely to 172.19.0.1/30
+        // before login or after logout.
+        val selfTailscaleIpv4 = normalizeTailscaleIpv4(state.selfPeer?.primaryIpv4)
+        val tunIpv4Cidr = if (selfTailscaleIpv4 != null) "$selfTailscaleIpv4/32" else FALLBACK_TUN_IPV4_CIDR
+        val selfTailscaleIpv6 = normalizeTailscaleIpv6(state.selfPeer?.primaryIpv6)
+        val tunIpv6Cidr = if (selfTailscaleIpv6 != null) "$selfTailscaleIpv6/128" else FALLBACK_TUN_IPV6_CIDR
+        val usesTailscaleTunIp = selfTailscaleIpv4 != null
+
         // Root sing-box 1.14 JSON
         val root = buildJsonObject {
             put(
@@ -281,12 +342,23 @@ object ConfigBuilder {
                             put(
                                 "address",
                                 buildJsonArray {
-                                    add(JsonPrimitive("172.19.0.1/30"))
+                                    add(JsonPrimitive(tunIpv4Cidr))
                                     if (enableIpv6) {
-                                        add(JsonPrimitive("fdfe:dcba:9876::1/126"))
+                                        add(JsonPrimitive(tunIpv6Cidr))
                                     }
                                 }
                             )
+                            if (usesTailscaleTunIp) {
+                                put(
+                                    "dns_address",
+                                    buildJsonArray {
+                                        add(JsonPrimitive(TAILSCALE_MAGIC_DNS_IPV4))
+                                        if (enableIpv6) {
+                                            add(JsonPrimitive(TAILSCALE_MAGIC_DNS_IPV6))
+                                        }
+                                    }
+                                )
+                            }
                             put("mtu", 1400)
                             put("auto_route", true)
                             put("strict_route", !thresholds.allowLanAccess)
@@ -376,7 +448,9 @@ object ConfigBuilder {
             nativeExitNodeTarget = nativeExitTarget,
             usesProxyExit = useProxyExit,
             usesProxyRelay = relayHasProxyHop,
-            directFirstActive = directFirstActive
+            directFirstActive = directFirstActive,
+            tunIpv4Address = tunIpv4Cidr,
+            usesTailscaleTunIp = usesTailscaleTunIp
         )
     }
 

@@ -40,6 +40,8 @@ func TestSingScaleEndpointConcurrentTeardownNilSafety(t *testing.T) {
 
 	// Must never panic when server/backend is nil
 	ep.SingScaleSetPowerMode(true, false)
+	ep.SingScaleSetInboundLocalForward(false)
+	ep.SingScaleSetInboundLocalForward(true)
 	ep.InterfaceUpdated(ctx)
 	if ep.PreferredAddress(&adapter.InboundContext{}, netip.MustParseAddr("100.64.0.1")) {
 		t.Fatal("expected false PreferredAddress when backend is nil")
